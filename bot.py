@@ -1,6 +1,9 @@
 import os
+import re
 import json
+import threading
 import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
@@ -95,46 +98,10 @@ def build_full_message(data: dict) -> str:
     numbers_text = build_numbers_text(data)
     return LOTTERY_TEMPLATE.format(numbers=numbers_text)
 
-# ==================== ADDIS AI ====================
-def parse_user_intent(user_message: str, sender_first_name: str) -> dict:
-    """
-    AI ሰው የፃፈውን ተረድቶ JSON ይመልሳል።
-    Return format:
-    {
-      "intent": "book" | "question" | "other",
-      "number": 21,        ← ወይም null
-      "name": "አበበ"        ← ወይም null
-    }
-    """
-    prompt = f"""ከዚህ የ Telegram መልእክት ውስጥ የሚከተሉትን extract አድርግ።
-JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
+# ==================== ADDIS AI HELPERS ====================
 
-መልእክት: "{user_message}"
-ላኪ ስም: "{sender_first_name}"
-
-⚠️ IMPORTANT — ተጠቃሚ አማርኛን በ Latin ፊደል (Ethiopic transliteration) ሊጽፍ ይችላል።
-ምሳሌዎች:
-- "yaz" / "yazlign" / "yazliygn" = ያዝ / ይያዛልኝ → intent = "book"
-- "efeligalehu" / "efelgalehu" = እፈልጋለሁ → intent = "book"
-- "set" / "stelign" / "steligna" = ስጠኝ → intent = "book"
-- "register" / "book" / "take" / "I want" / "give me" → intent = "book"
-- "min neger" / "min new" = ምን ነገር / ምን ነው → intent = "question"
-- "lijoch nachen" / "lijochn" = ልጆቹ ናቸን → intent = "other"
-- ቁጥር ብቻ ሲጽፍ (21, 45, #12) → intent = "book"
-
-Rules:
-- intent = "book" ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ
-  (አማርኛ: ያዝ፣ ይያዛልኝ፣ እፈልጋለሁ፣ ስጠኝ)
-  (Latin/Amharic: yaz, yazlign, efeligalehu, set, stelign)
-  (English: book, register, take, I want, give me)
-- intent = "question" ← ጥያቄ ከሆነ (አማርኛም ሆነ English ወይም Latin)
-- intent = "other" ← ሌላ ከሆነ
-- number = ያለው ቁጥር (1-100)፣ ከሌለ null
-- name = በመልእክቱ ውስጥ የተጠቀሰ ስም (Latin ፊደልም ቢሆን ይቀበል)፣ ካልሆነ null
-
-JSON format ብቻ:
-{{"intent": "book", "number": 21, "name": "አበበ"}}"""
-
+def addis_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str:
+    """ሁሉም Addis AI call አንድ ቦታ ያልፋል"""
     try:
         response = requests.post(
             "https://api.addisassistant.com/api/v1/chat_generate",
@@ -147,19 +114,71 @@ JSON format ብቻ:
                 "prompt": prompt,
                 "target_language": "am",
                 "generation_config": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 80
+                    "temperature": temperature,
+                    "maxOutputTokens": max_tokens
                 }
             },
-            timeout=15
+            timeout=20
         )
         data = response.json()
         inner = data.get("data", data)
-        raw = inner.get("response_text", "").strip()
+        result = inner.get("response_text", "").strip()
+        return result
+    except Exception as e:
+        print(f"❌ Addis AI call error: {e}")
+        return ""
 
-        # JSON parse
-        import re
-        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+
+def translate_to_amharic(text: str) -> str:
+    """
+    Latin ፊደል አማርኛ (Ethiopic transliteration) ወደ አማርኛ ፊደል ይቀይራል።
+    ቀድሞ አማርኛ ወይም English ከሆነ ይመልሰዋል።
+    """
+    # ቀድሞ አማርኛ ፊደል ከሆነ translate አያስፈልግም
+    has_amharic = any('\u1200' <= c <= '\u137F' for c in text)
+    if has_amharic:
+        return text
+
+    prompt = f"""ይህ መልእክት አማርኛን በ Latin ፊደል የጻፈ ሊሆን ይችላል (Ethiopic transliteration)።
+ወደ አማርኛ ፊደል ቀይረህ ስጠኝ። ትርጉም አያስፈልግም — ፊደሉን ብቻ ቀይር።
+English ቃላት ካሉ እንዳሉ ተው።
+ቁጥሮች እንዳሉ ተው።
+
+መልእክት: "{text}"
+
+አማርኛ ፊደል ብቻ ስጥ። ምንም ማብራሪያ አታክል።"""
+
+    result = addis_call(prompt, max_tokens=150, temperature=0.1)
+    if result:
+        print(f"🔄 Translated: '{text}' → '{result}'")
+        return result
+    return text  # fallback — original text
+
+
+def parse_user_intent(amharic_text: str, sender_first_name: str) -> dict:
+    """
+    (ቀድሞ translated የሆነ) አማርኛ text ወስዶ intent + number + name ይመልሳል።
+    """
+    prompt = f"""ከዚህ Telegram መልእክት ውስጥ intent፣ number፣ name extract አድርግ።
+JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
+
+መልእክት: "{amharic_text}"
+ላኪ ስም: "{sender_first_name}"
+
+Rules:
+- intent = "book"     ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ (ያዝ፣ እፈልጋለሁ፣ ስጠኝ፣ ቁጥር ፈልጌያለሁ፣ register፣ book፣ take)
+- intent = "question" ← ጥያቄ ከሆነ (ምን፣ እንዴት፣ መቼ፣ ቁጥር አለ?)
+- intent = "other"    ← ሌላ ከሆነ
+- number = ያለው ቁጥር 1–100፣ ከሌለ null
+- name   = በመልእክቱ የተጠቀሰ ስም፣ ከሌለ null
+
+JSON format ብቻ:
+{{"intent": "book", "number": 21, "name": null}}"""
+
+    result = addis_call(prompt, max_tokens=80, temperature=0.1)
+
+    try:
+        match = re.search(r'\{.*?\}', result, re.DOTALL)
         if match:
             parsed = json.loads(match.group())
             return {
@@ -168,82 +187,44 @@ JSON format ብቻ:
                 "name": parsed.get("name", None)
             }
     except Exception as e:
-        print(f"❌ parse_user_intent error: {e}")
+        print(f"❌ parse_user_intent JSON error: {e} | raw: {result}")
 
-    # ── Fallback 1: English/Latin keyword check ──
-    text_lower = user_message.lower()
-    BOOK_KEYWORDS = [
-        "yaz", "yazlign", "yazliygn", "efeligalehu", "efelgalehu",
-        "set ", "stelign", "steligna", "lijochn",
-        "book", "register", "take", "i want", "give me", "iwant",
-        "ያዝ", "ይያዛልኝ", "እፈልጋለሁ", "ስጠኝ"
-    ]
-    is_book = any(kw in text_lower for kw in BOOK_KEYWORDS)
-
-    # ── Fallback 2: ቁጥር ብቻ ካለ book አድርጎ ይቁጠር ──
-    for word in user_message.split():
+    # Fallback — ቁጥር ብቻ ካለ
+    for word in amharic_text.split():
         cleaned = word.replace("#", "").strip()
         try:
             num = int(cleaned)
             if 1 <= num <= 100:
-                intent = "book" if (is_book or True) else "other"
                 return {"intent": "book", "number": num, "name": None}
         except ValueError:
             continue
 
-    if is_book:
-        return {"intent": "book", "number": None, "name": None}
-
     return {"intent": "other", "number": None, "name": None}
 
 
-def ask_addis_ai(prompt: str, context_info: str) -> str:
-    """General AI reply — ጥያቄ ሲኖር"""
-    system_context = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም።
-
-⚠️ ተጠቃሚ አማርኛን በ Latin ፊደል (transliteration) ሊጽፍ ይችላል — ተረዳው።
-ምሳሌ: "min new" = ምን ነው, "ante man neh" = አንተ ማን ነህ, "yikertal" = ይቅርታ
-መልሱ ግን ሁልጊዜ አማርኛ ብቻ ይሁን።
+def ask_addis_ai(user_message: str, amharic_message: str, context_info: str) -> str:
+    """
+    ጥያቄ ወይም other intent ሲሆን AI ይመልሳል።
+    user_message  = original (Latin ወይም አማርኛ)
+    amharic_message = translated አማርኛ
+    """
+    prompt = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም።
 
 የአሁን ሁኔታ: {context_info}
 
 ህጎች:
 - ክፍያ ጥያቄ → CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729
-- ሌላ ጥያቄ → ጨዋ እና አጭር መልስ"""
+- ሌላ ጥያቄ → ጨዋ እና አጭር መልስ
 
-    full_prompt = f"{system_context}\n\nተጠቃሚ: {prompt}"
+ተጠቃሚ (አማርኛ): {amharic_message}"""
 
-    try:
-        response = requests.post(
-            "https://api.addisassistant.com/api/v1/chat_generate",
-            headers={
-                "x-api-key": get_next_key(),
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "Addis-፩-አሌፍ",
-                "prompt": full_prompt,
-                "target_language": "am",
-                "generation_config": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 300
-                }
-            },
-            timeout=30
-        )
-        data = response.json()
-        inner = data.get("data", data)
-        result = inner.get("response_text", None)
-        if not result:
-            print(f"❌ Addis AI empty response: {data}")
-            return "❌ መልስ ማምጣት አልተቻለም።"
-        print(f"✅ Addis AI OK: {result[:50]}")
+    result = addis_call(prompt, max_tokens=300, temperature=0.7)
+    if result:
         return result
-    except Exception as e:
-        print(f"❌ Addis AI error: {e}")
-        return "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
+    return "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
 
 # ==================== BOT HANDLERS ====================
+
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
@@ -264,6 +245,7 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["lottery_message_id"] = sent.message_id
     data["chat_id"] = update.effective_chat.id
     save_data(data)
+
 
 async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -296,6 +278,7 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_lottery_message(context.bot, data)
     await update.message.reply_text(f"✅ {slot['first_name']} ክፍያ ተረጋግጧል!")
 
+
 async def update_lottery_message(bot: Bot, data: dict):
     if data.get("lottery_message_id") and data.get("chat_id"):
         try:
@@ -307,6 +290,7 @@ async def update_lottery_message(bot: Bot, data: dict):
             )
         except Exception as e:
             print(f"Message update error: {e}")
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -320,17 +304,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free = 20 - filled
     context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
 
-    # ── AI intent parse ──
-    parsed = parse_user_intent(user_text, sender_first_name)
+    # ── Step 1: Latin → አማርኛ translate ──
+    amharic_text = translate_to_amharic(user_text)
+
+    # ── Step 2: Intent parse (translated text ይጠቀማል) ──
+    parsed = parse_user_intent(amharic_text, sender_first_name)
     intent = parsed.get("intent", "other")
     number = parsed.get("number", None)
     ai_name = parsed.get("name", None)
 
-    # ስም — AI ከparsed ካለ ይጠቀማል፣ ካልሆነ sender ስም
     display_name = ai_name if ai_name else sender_first_name
 
-    print(f"📩 '{user_text}' → intent={intent}, number={number}, name={display_name}")
+    print(f"📩 original='{user_text}' | amharic='{amharic_text}' | intent={intent} | number={number} | name={display_name}")
 
+    # ── Step 3: Handle intent ──
     if intent == "book" and number and 1 <= number <= 100:
         slot_id, slot = get_slot_by_number(number, data)
 
@@ -339,14 +326,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if slot["owner"]:
-            # ቁጥሩ ተይዟል
             free_slots = [s for s in data["slots"].values() if not s["owner"]]
             free_numbers = [s["numbers"][0] for s in free_slots[:5]]
             ctx = f"ቁጥር {number} አስቀድሞ በ {slot['first_name']} ተይዟል። ነፃ ቁጥሮች: {free_numbers}"
-            reply = ask_addis_ai(user_text, ctx)
+            reply = ask_addis_ai(user_text, amharic_text, ctx)
             await update.message.reply_text(reply)
         else:
-            # ቁጥሩ ነፃ ነው — ይያዛል
             data["slots"][slot_id]["owner"] = update.effective_user.id
             data["slots"][slot_id]["first_name"] = display_name
             save_data(data)
@@ -371,7 +356,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     elif intent == "book" and not number:
-        # intent book ነው ግን ቁጥር አልተጠቀሰም
         free_slots = [s for s in data["slots"].values() if not s["owner"]]
         free_numbers = [s["numbers"][0] for s in free_slots[:5]]
         await update.message.reply_text(
@@ -379,18 +363,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ቁጥሩን ብቻ ፃፍ። ለምሳሌ: 21"
         )
 
-    elif intent == "question":
-        reply = ask_addis_ai(user_text, context_info)
-        await update.message.reply_text(reply)
-
     else:
-        # other — AI ይመልሳል
-        reply = ask_addis_ai(user_text, context_info)
+        # question ወይም other — AI ይመልሳል
+        reply = ask_addis_ai(user_text, amharic_text, context_info)
         await update.message.reply_text(reply)
 
 # ==================== KEEP ALIVE ====================
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 class KeepAlive(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -406,6 +384,7 @@ def run_server():
     server.serve_forever()
 
 # ==================== MAIN ====================
+
 def main():
     thread = threading.Thread(target=run_server)
     thread.daemon = True
