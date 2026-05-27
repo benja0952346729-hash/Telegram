@@ -65,7 +65,8 @@ def load_data():
     return {
         "slots": slots,
         "lottery_message_id": None,
-        "chat_id": None
+        "chat_id": None,
+        "payments": {}
     }
 
 def save_data(data):
@@ -114,14 +115,25 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 
 Rules:
 - intent = "book" ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ (ያዝ፣ ይያዛልኝ፣ እፈልጋለሁ፣ register፣ ቁጥር ብቻ ሲፅፍ)
+  ⚠️ "ትላንት"፣ "ነበር"፣ "ባለፈ"፣ "በፊት"፣ "ቀድሞ" ካለ → "book" አይሁን (past ማለት ነው) — ግን ሁለቱ ካሉ ለምሳሌ "ትላንት አልያዝኩም ዛሬ 10 ያዝልኝ" → "book" ይሁን
 - intent = "cancel" ← ሰው ቁጥር ሊሰርዝ/ሊያስቀር ከፈለገ (አልፈልግም፣ ሰርዝ፣ አስቀር፣ cancel፣ ይሰረዝልኝ)
+- intent = "payment" ← ሰው ብር ልኳል/ከፍሏል ሲል (ብር ልኬ፣ ከፈልኩ፣ ገቢ አደረጉ፣ ገቢ ላክሁ፣ ብር ቁጥር ብቻ ሲፅፍ ለምሳሌ 400 ወይም 800)
 - intent = "question" ← ጥያቄ ከሆነ
+- intent = "past_complaint" ← ሰው ባለፈ ጨዋታ ቅሬታ ሲያቀርብ (ትላንት ይዤ ነበር ለምን አልያዝኩም፣ ቀድሞ ከፍዬ ነበር፣ ባለፈ ጨዋታ etc) — ዛሬ action ከሌለ
 - intent = "other" ← ሌላ ከሆነ
-- number = ያለው ቁጥር (1-100)፣ ከሌለ null
+- number = ዋና ቁጥር (1-100)፣ ከሌለ null
+- numbers = ሁሉም ቁጥሮች array (ለምሳሌ [10, 25, 36])፣ አንድ ብቻ ከሆነ [21]፣ ከሌለ []
+- amount = የብር መጠን ካለ (ለምሳሌ 400፣ 800፣ 200)፣ ከሌለ null
 - name = በመልእክቱ ውስጥ የተጠቀሰ ስም ከሌለ null (sender ስም አይደለም)
 
+ምሳሌዎች:
+"10,25,36" → {{"intent":"book","number":10,"numbers":[10,25,36],"name":null,"amount":null}}
+"21  29  31" → {{"intent":"book","number":21,"numbers":[21,29,31],"name":null,"amount":null}}
+"25&26&31" → {{"intent":"book","number":25,"numbers":[25,26,31],"name":null,"amount":null}}
+"06 አበበ ብሎ ያዝ" → {{"intent":"book","number":6,"numbers":[6],"name":"አበበ","amount":null}}
+
 JSON format ብቻ:
-{{"intent": "book", "number": 21, "name": "አበበ"}}"""
+{{"intent": "book", "number": 21, "numbers": [21], "name": "አበበ", "amount": null}}"""
 
     try:
         response = requests.post(
@@ -153,7 +165,9 @@ JSON format ብቻ:
             return {
                 "intent": parsed.get("intent", "other"),
                 "number": parsed.get("number", None),
-                "name": parsed.get("name", None)
+                "numbers": parsed.get("numbers", []),
+                "name": parsed.get("name", None),
+                "amount": parsed.get("amount", None)
             }
     except Exception as e:
         print(f"❌ parse_user_intent error: {e}")
@@ -164,21 +178,25 @@ JSON format ብቻ:
         try:
             num = int(cleaned)
             if 1 <= num <= 100:
-                return {"intent": "book", "number": num, "name": None}
+                return {"intent": "book", "number": num, "numbers": [num], "name": None, "amount": None}
         except ValueError:
             continue
 
-    return {"intent": "other", "number": None, "name": None}
+    return {"intent": "other", "number": None, "numbers": [], "name": None, "amount": None}
 
 
 def ask_addis_ai(prompt: str, context_info: str) -> str:
     """General AI reply — ጥያቄ ሲኖር"""
-    system_context = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም።
+    system_context = f"""አንተ የሎተሪ bot አስተዳዳሪ ነህ። አማርኛ ብቻ ተናገር። አጭር፣ ግልጽ እና ሰብዓዊ መልስ ስጥ። emoji ተጠቀም።
 
-የአሁን ሁኔታ: {context_info}
+የአሁን ሁኔታ:
+{context_info}
 
-ህጎች:
+ህጎቸ እና አስተሳሰቦች:
 - ክፍያ ጥያቄ → CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729
+- ባለፈ/ትላንት ጨዋታ ቅሬታ → "ያ ጨዋታ ተጠናቋል። ይህ አዲስ ጨዋታ ነው። እንደገና መመዝገብ ይቻላል!" በለ
+- slot ለምን አልተያዘም ጥያቄ → slot ሁኔታ ተጠቅምህ አስረዳ (ሂሳብ አልተረጋገጠም፣ ቀደም ሌላ ሰው ይዞታል፣ etc)
+- ሰው ተበሳጭቶ ቢነግርህ → ይቅርታ ጠይቅ፣ ያስረዳ፣ መፍትሔ ስጥ
 - ሌላ ጥያቄ → ጨዋ እና አጭር መልስ"""
 
     full_prompt = f"{system_context}\n\nተጠቃሚ: {prompt}"
@@ -319,6 +337,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ስም — AI ከparsed ካለ ይጠቀማል፣ ካልሆነ sender ስም
     display_name = ai_name if ai_name else sender_first_name
+    ai_amount = parsed.get("amount", None)
+    numbers_list = parsed.get("numbers", [])
+    # AI extract ያደርጋል — fallback አያስፈልግም
+    if not numbers_list and number:
+        numbers_list = [number]
 
     # ቁጥር ካለ slot status context ውስጥ ጨምር
     if number and 1 <= number <= 100:
@@ -337,6 +360,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     print(f"📩 '{user_text}' → intent={intent}, number={number}, name={display_name}")
+
+    if intent == "payment":
+        user_id = str(update.effective_user.id)
+        if "payments" not in data:
+            data["payments"] = {}
+
+        # ብር መጠን ማወቅ — AI amount ወይም ቁጥር ብቻ ሲፅፍ slot count × 400
+        amount = 0
+        if ai_amount:
+            try:
+                amount = int(ai_amount)
+            except:
+                amount = 0
+
+        if amount == 0 and number and 1 <= number <= 100:
+            # ቁጥር ብቻ ከሆነ → 400 ብር per slot
+            amount = 400
+
+        if amount > 0:
+            prev = data["payments"].get(user_id, 0)
+            total = prev + amount
+            data["payments"][user_id] = total
+            save_data(data)
+
+            await update.message.reply_text(
+                f"እሺ {total:,} ገቢ 🙏
+"
+                f"አስተዳዳሪው ያረጋግጣል — board ላይ ማየት ይችላሉ።"
+            )
+        else:
+            await update.message.reply_text("❌ የብር መጠን ማወቅ አልተቻለም። ደግሞ ይሞክሩ።")
+        return
+
+    if intent == "past_complaint":
+        reply = ask_addis_ai(user_text, context_info)
+        await update.message.reply_text(reply)
+        return
 
     if intent == "cancel" and number and 1 <= number <= 100:
         slot_id, slot = get_slot_by_number(number, data)
@@ -368,44 +428,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if intent == "book" and number and 1 <= number <= 100:
-        slot_id, slot = get_slot_by_number(number, data)
+    if intent == "book" and numbers_list:
+        booked = []
+        already_taken = []
+        not_found = []
 
-        if slot is None:
-            await update.message.reply_text(f"❌ ቁጥር {number} አልተገኘም።")
-            return
+        for num in numbers_list:
+            slot_id, slot = get_slot_by_number(num, data)
+            if slot is None:
+                not_found.append(num)
+            elif slot["owner"]:
+                already_taken.append((num, slot["first_name"]))
+            else:
+                data["slots"][slot_id]["owner"] = update.effective_user.id
+                data["slots"][slot_id]["first_name"] = display_name
+                booked.append(slot)
 
-        if slot["owner"]:
-            # ቁጥሩ ተይዟል
-            free_slots = [s for s in data["slots"].values() if not s["owner"]]
-            free_numbers = [s["numbers"][0] for s in free_slots[:5]]
-            ctx = f"ቁጥር {number} አስቀድሞ በ {slot['first_name']} ተይዟል። ነፃ ቁጥሮች: {free_numbers}"
-            reply = ask_addis_ai(user_text, ctx)
-            await update.message.reply_text(reply)
-        else:
-            # ቁጥሩ ነፃ ነው — ይያዛል
-            data["slots"][slot_id]["owner"] = update.effective_user.id
-            data["slots"][slot_id]["first_name"] = display_name
+        if booked or already_taken or not_found:
             save_data(data)
 
-            nums = slot["numbers"]
-            reply = (
-                f"✅ {display_name} ቁጥሮቻቸው:\n"
-                f"{nums[0]:02d}# {nums[1]:02d}# {nums[2]:02d}# {nums[3]:02d}# {nums[4]:02d}#\n\n"
-                f"💰 400 ብር ከፍለህ/ሽ slot ህን/ሽን አረጋግጥ!\n\n"
+        reply_parts = []
+
+        if booked:
+            total_price = len(booked) * 400
+            all_nums = []
+            for s in booked:
+                all_nums += s["numbers"]
+            nums_str = "  ".join([f"{n:02d}#" for n in all_nums])
+            reply_parts.append(
+                f"✅ {display_name} ቁጥሮቻቸው:\n{nums_str}\n\n"
+                f"💰 {total_price} ብር ከፍለህ/ሽ slot ህን/ሽን አረጋግጥ!\n\n"
                 f"🏦 CBE: 1000641057146\n"
                 f"🏦 አዋሽ: 01335630641400\n"
                 f"🏦 ዳሽን: 5389857825011\n"
                 f"📱 ቴሌ ብር: 0952346729"
             )
-            await update.message.reply_text(reply)
             await update_lottery_message(context.bot, data)
 
-            filled = sum(1 for s in data["slots"].values() if s["owner"])
-            if filled == 20:
-                await update.message.reply_text(
-                    "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! ትዕግስት አድርጉ... 🎰"
-                )
+        if already_taken:
+            taken_str = ", ".join([f"{n} (በ {name})" for n, name in already_taken])
+            free_slots = [s for s in data["slots"].values() if not s["owner"]]
+            free_nums = [s["numbers"][0] for s in free_slots[:5]]
+            reply_parts.append(f"⚠️ እነዚህ ቁጥሮች ተይዘዋል: {taken_str}\nነፃ ቁጥሮች: {free_nums}")
+
+        if not_found:
+            reply_parts.append(f"❌ እነዚህ ቁጥሮች አልተገኙም: {not_found}")
+
+        if reply_parts:
+            await update.message.reply_text("\n\n".join(reply_parts))
+
+        filled = sum(1 for s in data["slots"].values() if s["owner"])
+        if filled == 20:
+            await update.message.reply_text(
+                "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! ትዕግስት አድርጉ... 🎰"
+            )
 
     elif intent == "question":
         reply = ask_addis_ai(user_text, context_info)
