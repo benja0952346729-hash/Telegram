@@ -64,18 +64,18 @@ def get_slot_by_number(number: int, data: dict):
 
 def build_numbers_text(data: dict) -> str:
     """ሁሉም ቁጥሮች ያለ owner ይፃፋሉ"""
-    lines = []
+    groups = []
     for slot_id, slot in data["slots"].items():
         first_num = slot["numbers"][0]
         last_num = slot["numbers"][-1]
         if slot["owner"]:
             name = slot["first_name"]
             paid_mark = "✅" if slot["paid"] else "⏳"
-            lines.append(f"{first_num:02d}# - {last_num:02d}# {name} {paid_mark}")
+            groups.append(f"{first_num:02d}# - {last_num:02d}# {name} {paid_mark}")
         else:
-            for num in slot["numbers"]:
-                lines.append(f"{num:02d}#")
-    return "\n".join(lines)
+            group_lines = "\n".join(f"{num:02d}#" for num in slot["numbers"])
+            groups.append(group_lines)
+    return "\n\n".join(groups)
 
 def build_full_message(data: dict) -> str:
     numbers_text = build_numbers_text(data)
