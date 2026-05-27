@@ -133,6 +133,8 @@ def _format_first_line(num: int, slot: dict) -> str:
     else:
         p2_name = slot["p2_name"] or ""
         p2_mark = "✅" if slot["p2_paid"] else "⏳"
+        if slot["p1_paid"] and slot["p2_paid"]:
+            return f"{n} {p1_name}+{p2_name} ✅"
         return f"{n} {p1_name}{p1_mark}+{p2_name}{p2_mark}"
 
 def build_full_message(data: dict) -> str:
