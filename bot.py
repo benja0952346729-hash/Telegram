@@ -385,9 +385,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_data(data)
 
             await update.message.reply_text(
-                f"እሺ {total:,} ገቢ 🙏
-"
-                f"አስተዳዳሪው ያረጋግጣል — board ላይ ማየት ይችላሉ።"
+                f"እሺ {total:,} ገቢ 🙏\nአስተዳዳሪው ያረጋግጣል — board ላይ ማየት ይችላሉ።"
             )
         else:
             await update.message.reply_text("❌ የብር መጠን ማወቅ አልተቻለም። ደግሞ ይሞክሩ።")
@@ -422,9 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update_lottery_message(context.bot, data)
         await update.message.reply_text(
-            f"🗑️ {owner_name} — ቁጥር {number} slot ተሰርዟል።
-"
-            f"ቁጥሩ አሁን ነፃ ነው! 🔓"
+            f"🗑️ {owner_name} — ቁጥር {number} slot ተሰርዟል።\nቁጥሩ አሁን ነፃ ነው! 🔓"
         )
         return
 
