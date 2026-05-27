@@ -351,6 +351,11 @@ def main():
     app.add_handler(CommandHandler("paid", mark_paid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # API Keys log
+    print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded:")
+    for i, key in enumerate(ADDIS_AI_KEYS):
+        masked = key[:8] + "..." + key[-4:] if len(key) > 12 else "SHORT_KEY"
+        print(f"  Key {i+1}: {masked}")
     print("✅ Bot እየሰራ ነው...")
     app.run_polling(drop_pending_updates=True)
 
