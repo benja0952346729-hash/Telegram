@@ -138,7 +138,8 @@ def ask_addis_ai(prompt: str, context_info: str) -> str:
             timeout=30
         )
         data = response.json()
-        result = data.get("response_text", None)
+        inner = data.get("data", data)
+        result = inner.get("response_text", None)
         if not result:
             print(f"❌ Addis AI empty response: {data}")
             return "❌ መልስ ማምጣት አልተቻለም።"
