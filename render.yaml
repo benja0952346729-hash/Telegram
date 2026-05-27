@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: lottery-bot
+    runtime: python
+    startCommand: python bot.py
+    envVarGroups: []
