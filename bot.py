@@ -82,6 +82,39 @@ def build_full_message(data: dict) -> str:
     return LOTTERY_TEMPLATE.format(numbers=numbers_text)
 
 # ==================== GROQ AI ====================
+
+def is_number_booking_intent(user_message: str, number: int) -> bool:
+    """Groq ይጠይቃል - ሰው ቁጥር ሊይዝ/ሊመዘገብ ፈልጓል? YES ወይም NO"""
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "አንተ intent detector ነህ። "
+                        "ሰው የሎተሪ ቁጥር ሊይዝ/ሊመዘገብ ፈልጓል? "
+                        "YES ወይም NO ብቻ መልስ። ሌላ ምንም አትፃፍ።"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"መልእክት: '{user_message}'\n"
+                        f"ቁጥር: {number}\n\n"
+                        f"ይህ ሰው ቁጥር {number}ን በሎተሪ ሊይዝ/ሊመዘገብ ፈልጓል?"
+                    )
+                }
+            ],
+            max_tokens=5
+        )
+        answer = response.choices[0].message.content.strip().upper()
+        return "YES" in answer
+    except Exception as e:
+        print(f"Intent check error: {e}")
+        # Error ሲኖር safe side - don't book
+        return False
+
 def ask_groq(user_message: str, context_info: str) -> str:
     system_prompt = f"""አንተ የቴሌግራም lottery bot ነህ። አማርኛ ብቻ ተናገር።
 
@@ -89,8 +122,6 @@ def ask_groq(user_message: str, context_info: str) -> str:
 {context_info}
 
 ህጎች:
-- ሰው ቁጥር ሲጠይቅ (ለምሳሌ "53" ወይም "53 ያዝልኝ") → slot ያስሰላል እና ያረጋግጣል
-- ቁጥሩ ከ 1-100 ውጪ ከሆነ → "ከ 1 እስከ 100 ያለ ቁጥር ብቻ ምረጥ" በል
 - ቁጥሩ taken ከሆነ → ነፃ ቁጥሮችን ጠቁም
 - ክፍያ ጥያቄ ሲመጣ → የባንክ ቁጥሮቹን ስጥ (CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729)
 - ሌላ ጥያቄ ሲመጣ → ጨዋ እና አጭር መልስ ስጥ
@@ -133,7 +164,7 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
 
 async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/paid <slot_id> - Admin ክፍያ ሲያረጋግጥ"""
+    """/paid <number> - Admin ክፍያ ሲያረጋግጥ"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
@@ -207,7 +238,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply = ask_groq(user_text, context_info)
             await update.message.reply_text(reply)
         else:
-            # ነፃ ነው - ይያዛል
+            # ✅ Intent check - ሰው እውነትም ቁጥር ሊይዝ ፈልጓል?
+            if not is_number_booking_intent(user_text, number):
+                # ቁጥር ጠቅሷል ግን ሊይዝ አይደለም (ለምሳሌ "2 ጊዜ ልኬልሃለሁ")
+                filled = sum(1 for s in data["slots"].values() if s["owner"])
+                free = 20 - filled
+                context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
+                reply = ask_groq(user_text, context_info)
+                await update.message.reply_text(reply)
+                return
+
+            # ነፃ ነው እና intent ትክክል ነው - ይያዛል
             data["slots"][slot_id]["owner"] = update.effective_user.id
             data["slots"][slot_id]["first_name"] = first_name
             save_data(data)
