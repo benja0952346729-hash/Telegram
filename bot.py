@@ -6,9 +6,9 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 from groq import Groq
 
 # ==================== CONFIG ====================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-GROQ_API_KEY = "YOUR_GROQ_API_KEY"
-ADMIN_TELEGRAM_ID = 123456789  # አንተ Telegram ID
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 DATA_FILE = "lottery_data.json"
 
 # ==================== LOTTERY TEMPLATE ====================
