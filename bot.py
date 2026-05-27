@@ -138,9 +138,14 @@ def ask_addis_ai(prompt: str, context_info: str) -> str:
             timeout=15
         )
         data = response.json()
-        return data.get("response_text", "❌ መልስ ማምጣት አልተቻለም።")
+        result = data.get("response_text", None)
+        if not result:
+            print(f"❌ Addis AI empty response: {data}")
+            return "❌ መልስ ማምጣት አልተቻለም።"
+        print(f"✅ Addis AI OK: {result[:50]}")
+        return result
     except Exception as e:
-        print(f"Addis AI error: {e}")
+        print(f"❌ Addis AI error: {e}")
         return "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
 
 def is_booking_intent(user_message: str, number: int) -> bool:
