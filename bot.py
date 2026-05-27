@@ -1,13 +1,12 @@
 import os
 import json
-import asyncio
+import requests
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from groq import Groq
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+ADDIS_AI_API_KEY = os.getenv("ADDIS_AI_API_KEY")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 DATA_FILE = "lottery_data.json"
 
@@ -28,16 +27,13 @@ CBE 1000641057146 biniyam dawit
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
 
-groq_client = Groq(api_key=GROQ_API_KEY)
-
 # ==================== DATA MANAGEMENT ====================
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    # Initialize fresh lottery data
     slots = {}
-    for i in range(1, 21):  # 20 slots
+    for i in range(1, 21):
         start = (i - 1) * 5 + 1
         slots[str(i)] = {
             "numbers": list(range(start, start + 5)),
@@ -56,98 +52,113 @@ def save_data(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def get_slot_by_number(number: int, data: dict):
-    """ቁጥሩ የትኛው slot ውስጥ እንደሆነ ያወቃል"""
     for slot_id, slot in data["slots"].items():
         if number in slot["numbers"]:
             return slot_id, slot
     return None, None
 
 def build_numbers_text(data: dict) -> str:
-    """ሁሉም ቁጥሮች ያለ owner ይፃፋሉ"""
+    """
+    FIX: ቁጥር ሲያዝ ስም የመጀመሪያ ቁጥር ላይ ብቻ ይፃፋል
+    ለምሳሌ:
+    06# ብኒያም ✅
+    07#
+    08#
+    09#
+    10#
+    """
     groups = []
     for slot_id, slot in data["slots"].items():
-        first_num = slot["numbers"][0]
-        last_num = slot["numbers"][-1]
-        if slot["owner"]:
-            name = slot["first_name"]
-            paid_mark = "✅" if slot["paid"] else "⏳"
-            groups.append(f"{first_num:02d}# - {last_num:02d}# {name} {paid_mark}")
-        else:
-            group_lines = "\n".join(f"{num:02d}#" for num in slot["numbers"])
-            groups.append(group_lines)
+        lines = []
+        for idx, num in enumerate(slot["numbers"]):
+            if idx == 0 and slot["owner"]:
+                # ስም እና paid mark የመጀመሪያ ቁጥር ላይ ብቻ
+                paid_mark = "✅" if slot["paid"] else "⏳"
+                lines.append(f"{num:02d}# {slot['first_name']} {paid_mark}")
+            else:
+                lines.append(f"{num:02d}#")
+        groups.append("\n".join(lines))
     return "\n\n".join(groups)
 
 def build_full_message(data: dict) -> str:
     numbers_text = build_numbers_text(data)
     return LOTTERY_TEMPLATE.format(numbers=numbers_text)
 
-# ==================== GROQ AI ====================
+# ==================== ADDIS AI ====================
+def ask_addis_ai(prompt: str, context_info: str) -> str:
+    """Addis AI — አማርኛ native support"""
+    system_context = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም።
 
-def is_number_booking_intent(user_message: str, number: int) -> bool:
-    """Groq ይጠይቃል - ሰው ቁጥር ሊይዝ/ሊመዘገብ ፈልጓል? YES ወይም NO"""
+የአሁን ሁኔታ: {context_info}
+
+ህጎች:
+- ክፍያ ጥያቄ → CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729
+- ሌላ ጥያቄ → ጨዋ እና አጭር መልስ"""
+
+    full_prompt = f"{system_context}\n\nተጠቃሚ: {prompt}"
+
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "አንተ intent detector ነህ። "
-                        "ሰው የሎተሪ ቁጥር ሊይዝ/ሊመዘገብ ፈልጓል? "
-                        "YES ወይም NO ብቻ መልስ። ሌላ ምንም አትፃፍ።"
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"መልእክት: '{user_message}'\n"
-                        f"ቁጥር: {number}\n\n"
-                        f"ይህ ሰው ቁጥር {number}ን በሎተሪ ሊይዝ/ሊመዘገብ ፈልጓል?"
-                    )
+        response = requests.post(
+            "https://api.addisassistant.com/api/v1/chat_generate",
+            headers={
+                "x-api-key": ADDIS_AI_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "Addis-፩-አሌፍ",
+                "prompt": full_prompt,
+                "target_language": "am",
+                "generation_config": {
+                    "temperature": 0.7,
+                    "maxOutputTokens": 300
                 }
-            ],
-            max_tokens=5
+            },
+            timeout=15
         )
-        answer = response.choices[0].message.content.strip().upper()
+        data = response.json()
+        return data.get("response_text", "❌ መልስ ማምጣት አልተቻለም።")
+    except Exception as e:
+        print(f"Addis AI error: {e}")
+        return "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
+
+def is_booking_intent(user_message: str, number: int) -> bool:
+    """Addis AI — ሰው ቁጥር ሊይዝ ፈልጓል? YES ወይም NO"""
+    try:
+        response = requests.post(
+            "https://api.addisassistant.com/api/v1/chat_generate",
+            headers={
+                "x-api-key": ADDIS_AI_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "Addis-፩-አሌፍ",
+                "prompt": (
+                    f"ይህ ሰው ቁጥር {number}ን በሎተሪ ሊይዝ/ሊመዘገብ ፈልጓል?\n"
+                    f"መልእክት: '{user_message}'\n"
+                    f"YES ወይም NO ብቻ መልስ።"
+                ),
+                "target_language": "am",
+                "generation_config": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 5
+                }
+            },
+            timeout=10
+        )
+        data = response.json()
+        answer = data.get("response_text", "NO").strip().upper()
         return "YES" in answer
     except Exception as e:
         print(f"Intent check error: {e}")
-        # Error ሲኖር safe side - don't book
         return False
-
-def ask_groq(user_message: str, context_info: str) -> str:
-    system_prompt = f"""አንተ የቴሌግራም lottery bot ነህ። አማርኛ ብቻ ተናገር።
-
-የአሁን lottery ሁኔታ:
-{context_info}
-
-ህጎች:
-- ቁጥሩ taken ከሆነ → ነፃ ቁጥሮችን ጠቁም
-- ክፍያ ጥያቄ ሲመጣ → የባንክ ቁጥሮቹን ስጥ (CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729)
-- ሌላ ጥያቄ ሲመጣ → ጨዋ እና አጭር መልስ ስጥ
-- ሁሌም emoji ተጠቀም
-
-አጭር እና ግልጽ መልስ ስጥ።"""
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message}
-        ],
-        max_tokens=300
-    )
-    return response.choices[0].message.content
 
 # ==================== BOT HANDLERS ====================
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin ብቻ lottery ይጀምራል /start_lottery"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
         return
 
     data = load_data()
-    # Reset data
     for i in range(1, 21):
         start = (i - 1) * 5 + 1
         data["slots"][str(i)] = {
@@ -164,12 +175,11 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
 
 async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/paid <number> - Admin ክፍያ ሲያረጋግጥ"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
     if not context.args:
-        await update.message.reply_text("አጠቃቀም: /paid <ቁጥር>\nለምሳሌ: /paid 53")
+        await update.message.reply_text("አጠቃቀም: /paid <ቁጥር>\nለምሳሌ: /paid 6")
         return
 
     try:
@@ -192,12 +202,10 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["slots"][slot_id]["paid"] = True
     save_data(data)
 
-    # Update message
     await update_lottery_message(context.bot, data)
     await update.message.reply_text(f"✅ {slot['first_name']} ክፍያ ተረጋግጧል!")
 
 async def update_lottery_message(bot: Bot, data: dict):
-    """Lottery message ያዘምናል"""
     if data.get("lottery_message_id") and data.get("chat_id"):
         try:
             new_text = build_full_message(data)
@@ -210,7 +218,6 @@ async def update_lottery_message(bot: Bot, data: dict):
             print(f"Message update error: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ሁሉም messages ይቀበላል"""
     if not update.message or not update.message.text:
         return
 
@@ -221,8 +228,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ቁጥር ተፅፏል?
     number = None
     for word in user_text.split():
+        cleaned = word.replace("#", "").strip()
         try:
-            number = int(word)
+            number = int(cleaned)
             break
         except ValueError:
             continue
@@ -231,55 +239,51 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         slot_id, slot = get_slot_by_number(number, data)
 
         if slot["owner"]:
-            # Taken - Groq ያስተናግዳል
+            # Taken
             free_slots = [s for s in data["slots"].values() if not s["owner"]]
             free_numbers = [s["numbers"][0] for s in free_slots[:5]]
             context_info = f"ቁጥር {number} አስቀድሞ በ {slot['first_name']} ተይዟል። ነፃ ቁጥሮች: {free_numbers}"
-            reply = ask_groq(user_text, context_info)
+            reply = ask_addis_ai(user_text, context_info)
             await update.message.reply_text(reply)
         else:
-            # ✅ Intent check - ሰው እውነትም ቁጥር ሊይዝ ፈልጓል?
-            if not is_number_booking_intent(user_text, number):
-                # ቁጥር ጠቅሷል ግን ሊይዝ አይደለም (ለምሳሌ "2 ጊዜ ልኬልሃለሁ")
+            # Intent check
+            if not is_booking_intent(user_text, number):
                 filled = sum(1 for s in data["slots"].values() if s["owner"])
                 free = 20 - filled
                 context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
-                reply = ask_groq(user_text, context_info)
+                reply = ask_addis_ai(user_text, context_info)
                 await update.message.reply_text(reply)
                 return
 
-            # ነፃ ነው እና intent ትክክል ነው - ይያዛል
+            # ነፃ ነው — ይያዛል
             data["slots"][slot_id]["owner"] = update.effective_user.id
             data["slots"][slot_id]["first_name"] = first_name
             save_data(data)
 
             nums = slot["numbers"]
             reply = (
-                f"✅ {first_name} ቁጥሮችህ:\n"
+                f"✅ {first_name} ቁጥሮችህ/ሽ:\n"
                 f"{nums[0]:02d}# {nums[1]:02d}# {nums[2]:02d}# {nums[3]:02d}# {nums[4]:02d}#\n\n"
-                f"💰 400 ብር ከፍለህ slot ህን አረጋግጥ!\n"
-                f"CBE: 1000641057146\n"
-                f"አዋሽ: 01335630641400\n"
-                f"ዳሽን: 5389857825011\n"
-                f"ቴሌ ብር: 0952346729"
+                f"💰 400 ብር ከፍለህ/ሽ slot ህን/ሽን አረጋግጥ!\n\n"
+                f"🏦 CBE: 1000641057146\n"
+                f"🏦 አዋሽ: 01335630641400\n"
+                f"🏦 ዳሽን: 5389857825011\n"
+                f"📱 ቴሌ ብር: 0952346729"
             )
             await update.message.reply_text(reply)
-
-            # Message ያዘምናል
             await update_lottery_message(context.bot, data)
 
-            # ሁሉም ተሞልቷ?
             filled = sum(1 for s in data["slots"].values() if s["owner"])
             if filled == 20:
                 await update.message.reply_text(
                     "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! ትዕግስት አድርጉ... 🎰"
                 )
     else:
-        # ቁጥር አይደለም - Groq ያስተናግዳል
+        # ቁጥር አይደለም
         filled = sum(1 for s in data["slots"].values() if s["owner"])
         free = 20 - filled
         context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
-        reply = ask_groq(user_text, context_info)
+        reply = ask_addis_ai(user_text, context_info)
         await update.message.reply_text(reply)
 
 # ==================== MAIN ====================
