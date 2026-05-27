@@ -6,9 +6,31 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADDIS_AI_API_KEY = os.getenv("ADDIS_AI_API_KEY")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 DATA_FILE = "lottery_data.json"
+
+# 10 Addis AI API Keys rotation
+ADDIS_AI_KEYS = [
+    os.getenv("ADDIS_AI_API_KEY_1"),
+    os.getenv("ADDIS_AI_API_KEY_2"),
+    os.getenv("ADDIS_AI_API_KEY_3"),
+    os.getenv("ADDIS_AI_API_KEY_4"),
+    os.getenv("ADDIS_AI_API_KEY_5"),
+    os.getenv("ADDIS_AI_API_KEY_6"),
+    os.getenv("ADDIS_AI_API_KEY_7"),
+    os.getenv("ADDIS_AI_API_KEY_8"),
+    os.getenv("ADDIS_AI_API_KEY_9"),
+    os.getenv("ADDIS_AI_API_KEY_10"),
+]
+ADDIS_AI_KEYS = [k for k in ADDIS_AI_KEYS if k]  # None ያሉትን አስወግድ
+current_key_index = 0
+
+def get_next_key() -> str:
+    """Keys rotate — limit ሲደርስ ቀጣዩን ይጠቀማል"""
+    global current_key_index
+    key = ADDIS_AI_KEYS[current_key_index % len(ADDIS_AI_KEYS)]
+    current_key_index += 1
+    return key
 
 # ==================== LOTTERY TEMPLATE ====================
 LOTTERY_TEMPLATE = """በ 400 ብር 5 ቁጥሮችን በተከታታይ በመያዝ እድሎን ይሞክሩ ለ 20 ሰው ብቻ ፈጣን ዕድል መልካም ዕድል
@@ -101,7 +123,7 @@ def ask_addis_ai(prompt: str, context_info: str) -> str:
         response = requests.post(
             "https://api.addisassistant.com/api/v1/chat_generate",
             headers={
-                "x-api-key": ADDIS_AI_API_KEY,
+                "x-api-key": get_next_key(),
                 "Content-Type": "application/json"
             },
             json={
@@ -127,7 +149,7 @@ def is_booking_intent(user_message: str, number: int) -> bool:
         response = requests.post(
             "https://api.addisassistant.com/api/v1/chat_generate",
             headers={
-                "x-api-key": ADDIS_AI_API_KEY,
+                "x-api-key": get_next_key(),
                 "Content-Type": "application/json"
             },
             json={
@@ -286,8 +308,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = ask_addis_ai(user_text, context_info)
         await update.message.reply_text(reply)
 
+# ==================== KEEP ALIVE (Render Web Service) ====================
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class KeepAlive(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def log_message(self, format, *args):
+        pass
+
+def run_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), KeepAlive)
+    server.serve_forever()
+
 # ==================== MAIN ====================
 def main():
+    thread = threading.Thread(target=run_server)
+    thread.daemon = True
+    thread.start()
+
+    import asyncio
+    import telegram as tg
+
+    # ሌላ bot instance ካለ ያቁማል
+    async def close_others():
+        try:
+            bot = tg.Bot(token=TELEGRAM_BOT_TOKEN)
+            await bot.delete_webhook(drop_pending_updates=True)
+            await bot.close()
+        except Exception as e:
+            print(f"Close others: {e}")
+
+    asyncio.run(close_others())
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start_lottery", start_lottery))
@@ -295,7 +352,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ Bot እየሰራ ነው...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
