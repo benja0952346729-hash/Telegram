@@ -22,11 +22,10 @@ ADDIS_AI_KEYS = [
     os.getenv("ADDIS_AI_API_KEY_9"),
     os.getenv("ADDIS_AI_API_KEY_10"),
 ]
-ADDIS_AI_KEYS = [k for k in ADDIS_AI_KEYS if k]  # None ያሉትን አስወግድ
+ADDIS_AI_KEYS = [k for k in ADDIS_AI_KEYS if k]
 current_key_index = 0
 
 def get_next_key() -> str:
-    """Keys rotate — limit ሲደርስ ቀጣዩን ይጠቀማል"""
     global current_key_index
     key = ADDIS_AI_KEYS[current_key_index % len(ADDIS_AI_KEYS)]
     current_key_index += 1
@@ -80,21 +79,11 @@ def get_slot_by_number(number: int, data: dict):
     return None, None
 
 def build_numbers_text(data: dict) -> str:
-    """
-    FIX: ቁጥር ሲያዝ ስም የመጀመሪያ ቁጥር ላይ ብቻ ይፃፋል
-    ለምሳሌ:
-    06# ብኒያም ✅
-    07#
-    08#
-    09#
-    10#
-    """
     groups = []
     for slot_id, slot in data["slots"].items():
         lines = []
         for idx, num in enumerate(slot["numbers"]):
             if idx == 0 and slot["owner"]:
-                # ስም እና paid mark የመጀመሪያ ቁጥር ላይ ብቻ
                 paid_mark = "✅" if slot["paid"] else "⏳"
                 lines.append(f"{num:02d}# {slot['first_name']} {paid_mark}")
             else:
@@ -107,8 +96,82 @@ def build_full_message(data: dict) -> str:
     return LOTTERY_TEMPLATE.format(numbers=numbers_text)
 
 # ==================== ADDIS AI ====================
+def parse_user_intent(user_message: str, sender_first_name: str) -> dict:
+    """
+    AI ሰው የፃፈውን ተረድቶ JSON ይመልሳል።
+    Return format:
+    {
+      "intent": "book" | "question" | "other",
+      "number": 21,        ← ወይም null
+      "name": "አበበ"        ← ወይም null (ካልተጠቀሰ sender name ይጠቀማል)
+    }
+    """
+    prompt = f"""ከዚህ የ Telegram መልእክት ውስጥ የሚከተሉትን extract አድርግ።
+JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
+
+መልእክት: "{user_message}"
+ላኪ ስም: "{sender_first_name}"
+
+Rules:
+- intent = "book" ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ (ያዝ፣ ይያዛልኝ፣ እፈልጋለሁ፣ register፣ ቁጥር ብቻ ሲፅፍ)
+- intent = "question" ← ጥያቄ ከሆነ
+- intent = "other" ← ሌላ ከሆነ
+- number = ያለው ቁጥር (1-100)፣ ከሌለ null
+- name = በመልእክቱ ውስጥ የተጠቀሰ ስም ከሌለ null (sender ስም አይደለም)
+
+JSON format ብቻ:
+{{"intent": "book", "number": 21, "name": "አበበ"}}"""
+
+    try:
+        response = requests.post(
+            "https://api.addisassistant.com/api/v1/chat_generate",
+            headers={
+                "x-api-key": get_next_key(),
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "Addis-፩-አሌፍ",
+                "prompt": prompt,
+                "target_language": "am",
+                "generation_config": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 80
+                }
+            },
+            timeout=15
+        )
+        data = response.json()
+        inner = data.get("data", data)
+        raw = inner.get("response_text", "").strip()
+
+        # JSON parse
+        import re
+        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group())
+            return {
+                "intent": parsed.get("intent", "other"),
+                "number": parsed.get("number", None),
+                "name": parsed.get("name", None)
+            }
+    except Exception as e:
+        print(f"❌ parse_user_intent error: {e}")
+
+    # Fallback — ቁጥር ብቻ ካለ book አድርጎ ይቁጠር
+    for word in user_message.split():
+        cleaned = word.replace("#", "").strip()
+        try:
+            num = int(cleaned)
+            if 1 <= num <= 100:
+                return {"intent": "book", "number": num, "name": None}
+        except ValueError:
+            continue
+
+    return {"intent": "other", "number": None, "name": None}
+
+
 def ask_addis_ai(prompt: str, context_info: str) -> str:
-    """Addis AI — አማርኛ native support"""
+    """General AI reply — ጥያቄ ሲኖር"""
     system_context = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም።
 
 የአሁን ሁኔታ: {context_info}
@@ -148,37 +211,6 @@ def ask_addis_ai(prompt: str, context_info: str) -> str:
     except Exception as e:
         print(f"❌ Addis AI error: {e}")
         return "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
-
-def is_booking_intent(user_message: str, number: int) -> bool:
-    """Addis AI — ሰው ቁጥር ሊይዝ ፈልጓል? YES ወይም NO"""
-    try:
-        response = requests.post(
-            "https://api.addisassistant.com/api/v1/chat_generate",
-            headers={
-                "x-api-key": get_next_key(),
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "Addis-፩-አሌፍ",
-                "prompt": (
-                    f"ይህ ሰው ቁጥር {number}ን በሎተሪ ሊይዝ/ሊመዘገብ ፈልጓል?\n"
-                    f"መልእክት: '{user_message}'\n"
-                    f"YES ወይም NO ብቻ መልስ።"
-                ),
-                "target_language": "am",
-                "generation_config": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 5
-                }
-            },
-            timeout=10
-        )
-        data = response.json()
-        answer = data.get("response_text", "NO").strip().upper()
-        return "YES" in answer
-    except Exception as e:
-        print(f"Intent check error: {e}")
-        return False
 
 # ==================== BOT HANDLERS ====================
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,47 +282,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
-    first_name = update.effective_user.first_name or "ተጠቃሚ"
+    sender_first_name = update.effective_user.first_name or "ተጠቃሚ"
     data = load_data()
 
-    # ቁጥር ተፅፏል?
-    number = None
-    for word in user_text.split():
-        cleaned = word.replace("#", "").strip()
-        try:
-            number = int(cleaned)
-            break
-        except ValueError:
-            continue
+    filled = sum(1 for s in data["slots"].values() if s["owner"])
+    free = 20 - filled
+    context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
 
-    if number and 1 <= number <= 100:
+    # ── AI intent parse ──
+    parsed = parse_user_intent(user_text, sender_first_name)
+    intent = parsed.get("intent", "other")
+    number = parsed.get("number", None)
+    ai_name = parsed.get("name", None)
+
+    # ስም — AI ከparsed ካለ ይጠቀማል፣ ካልሆነ sender ስም
+    display_name = ai_name if ai_name else sender_first_name
+
+    print(f"📩 '{user_text}' → intent={intent}, number={number}, name={display_name}")
+
+    if intent == "book" and number and 1 <= number <= 100:
         slot_id, slot = get_slot_by_number(number, data)
 
+        if slot is None:
+            await update.message.reply_text(f"❌ ቁጥር {number} አልተገኘም።")
+            return
+
         if slot["owner"]:
-            # Taken
+            # ቁጥሩ ተይዟል
             free_slots = [s for s in data["slots"].values() if not s["owner"]]
             free_numbers = [s["numbers"][0] for s in free_slots[:5]]
-            context_info = f"ቁጥር {number} አስቀድሞ በ {slot['first_name']} ተይዟል። ነፃ ቁጥሮች: {free_numbers}"
-            reply = ask_addis_ai(user_text, context_info)
+            ctx = f"ቁጥር {number} አስቀድሞ በ {slot['first_name']} ተይዟል። ነፃ ቁጥሮች: {free_numbers}"
+            reply = ask_addis_ai(user_text, ctx)
             await update.message.reply_text(reply)
         else:
-            # Intent check
-            if not is_booking_intent(user_text, number):
-                filled = sum(1 for s in data["slots"].values() if s["owner"])
-                free = 20 - filled
-                context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
-                reply = ask_addis_ai(user_text, context_info)
-                await update.message.reply_text(reply)
-                return
-
-            # ነፃ ነው — ይያዛል
+            # ቁጥሩ ነፃ ነው — ይያዛል
             data["slots"][slot_id]["owner"] = update.effective_user.id
-            data["slots"][slot_id]["first_name"] = first_name
+            data["slots"][slot_id]["first_name"] = display_name
             save_data(data)
 
             nums = slot["numbers"]
             reply = (
-                f"✅ {first_name} ቁጥሮችህ/ሽ:\n"
+                f"✅ {display_name} ቁጥሮቻቸው:\n"
                 f"{nums[0]:02d}# {nums[1]:02d}# {nums[2]:02d}# {nums[3]:02d}# {nums[4]:02d}#\n\n"
                 f"💰 400 ብር ከፍለህ/ሽ slot ህን/ሽን አረጋግጥ!\n\n"
                 f"🏦 CBE: 1000641057146\n"
@@ -306,15 +338,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! ትዕግስት አድርጉ... 🎰"
                 )
-    else:
-        # ቁጥር አይደለም
-        filled = sum(1 for s in data["slots"].values() if s["owner"])
-        free = 20 - filled
-        context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
+
+    elif intent == "question":
         reply = ask_addis_ai(user_text, context_info)
         await update.message.reply_text(reply)
 
-# ==================== KEEP ALIVE (Render Web Service) ====================
+    else:
+        # other — AI ይመልሳል
+        reply = ask_addis_ai(user_text, context_info)
+        await update.message.reply_text(reply)
+
+# ==================== KEEP ALIVE ====================
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -340,7 +374,6 @@ def main():
     import asyncio
     import telegram as tg
 
-    # ሌላ bot instance ካለ ያቁማል
     async def close_others():
         try:
             bot = tg.Bot(token=TELEGRAM_BOT_TOKEN)
@@ -357,7 +390,6 @@ def main():
     app.add_handler(CommandHandler("paid", mark_paid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # API Keys log
     print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded:")
     for i, key in enumerate(ADDIS_AI_KEYS):
         masked = key[:8] + "..." + key[-4:] if len(key) > 12 else "SHORT_KEY"
