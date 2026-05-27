@@ -101,7 +101,7 @@ def parse_user_intent(user_message: str, sender_first_name: str) -> dict:
     AI ሰው የፃፈውን ተረድቶ JSON ይመልሳል።
     Return format:
     {
-      "intent": "book" | "question" | "other",
+      "intent": "book" | "cancel" | "question" | "other",
       "number": 21,        ← ወይም null
       "name": "አበበ"        ← ወይም null (ካልተጠቀሰ sender name ይጠቀማል)
     }
@@ -114,6 +114,7 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 
 Rules:
 - intent = "book" ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ (ያዝ፣ ይያዛልኝ፣ እፈልጋለሁ፣ register፣ ቁጥር ብቻ ሲፅፍ)
+- intent = "cancel" ← ሰው ቁጥር ሊሰርዝ/ሊያስቀር ከፈለገ (አልፈልግም፣ ሰርዝ፣ አስቀር፣ cancel፣ ይሰረዝልኝ)
 - intent = "question" ← ጥያቄ ከሆነ
 - intent = "other" ← ሌላ ከሆነ
 - number = ያለው ቁጥር (1-100)፣ ከሌለ null
@@ -287,7 +288,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     filled = sum(1 for s in data["slots"].values() if s["owner"])
     free = 20 - filled
-    context_info = f"ሞልቷል: {filled}/20 slots። ነፃ slots: {free}"
+
+    # ነፃ slot ቁጥሮች ዝርዝር
+    free_numbers = [s["numbers"][0] for s in data["slots"].values() if not s["owner"]]
+
+    # የያዙ ሰዎች ዝርዝር
+    taken_list = []
+    for s in data["slots"].values():
+        if s["owner"]:
+            paid_mark = "✅" if s["paid"] else "⏳"
+            taken_list.append(f"{s['numbers'][0]}-{s['numbers'][4]} ({s['first_name']} {paid_mark})")
+
+    context_info = (
+        f"የሎተሪ ሁኔታ:\n"
+        f"- ተይዘዋል: {filled}/20 slots\n"
+        f"- ቀርተዋል: {free} slots\n"
+        f"- ነፃ ቁጥሮች (የ slot መጀመሪያ): {free_numbers}\n"
+        f"- የያዙ slots: {', '.join(taken_list) if taken_list else 'ማንም የለም'}\n"
+        f"\n"
+        f"የሎተሪ ዋጋ: 400 ብር (ግማሽ 200 ብር)\n"
+        f"ሽልማቶች: 1ኛ 5000 ብር 🥇, 2ኛ 1000 ብር 🥈, 3ኛ 400 ብር 🥉\n"
+        f"ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729"
+    )
 
     # ── AI intent parse ──
     parsed = parse_user_intent(user_text, sender_first_name)
@@ -298,7 +320,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ስም — AI ከparsed ካለ ይጠቀማል፣ ካልሆነ sender ስም
     display_name = ai_name if ai_name else sender_first_name
 
+    # ቁጥር ካለ slot status context ውስጥ ጨምር
+    if number and 1 <= number <= 100:
+        slot_id, slot = get_slot_by_number(number, data)
+        if slot:
+            nums = slot["numbers"]
+            if slot["owner"]:
+                paid_status = "ክፍያ ተረጋግጧል ✅" if slot["paid"] else "ክፍያ ገና አልተረጋገጠም ⏳"
+                context_info += (
+                    f"። ቁጥር {number} ያለበት slot ({nums[0]}-{nums[4]}) "
+                    f"በ {slot['first_name']} ተይዟል — {paid_status}"
+                )
+            else:
+                context_info += (
+                    f"። ቁጥር {number} ያለበት slot ({nums[0]}-{nums[4]}) ነፃ ነው 🔓"
+                )
+
     print(f"📩 '{user_text}' → intent={intent}, number={number}, name={display_name}")
+
+    if intent == "cancel" and number and 1 <= number <= 100:
+        slot_id, slot = get_slot_by_number(number, data)
+
+        if slot is None:
+            await update.message.reply_text(f"❌ ቁጥር {number} አልተገኘም።")
+            return
+
+        if not slot["owner"]:
+            await update.message.reply_text(f"❌ ቁጥር {number} ገና አልተያዘም።")
+            return
+
+        # የያዘው ሰው ወይም admin ብቻ ሊሰርዝ ይችላል
+        if slot["owner"] != update.effective_user.id and update.effective_user.id != ADMIN_TELEGRAM_ID:
+            await update.message.reply_text("❌ ይህ slot ያንተ/ያንቺ አይደለም።")
+            return
+
+        owner_name = slot["first_name"]
+        data["slots"][slot_id]["owner"] = None
+        data["slots"][slot_id]["first_name"] = None
+        data["slots"][slot_id]["paid"] = False
+        save_data(data)
+
+        await update_lottery_message(context.bot, data)
+        await update.message.reply_text(
+            f"🗑️ {owner_name} — ቁጥር {number} slot ተሰርዟል።
+"
+            f"ቁጥሩ አሁን ነፃ ነው! 🔓"
+        )
+        return
 
     if intent == "book" and number and 1 <= number <= 100:
         slot_id, slot = get_slot_by_number(number, data)
@@ -352,6 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
+
 class KeepAlive(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -370,6 +439,7 @@ def main():
     thread = threading.Thread(target=run_server)
     thread.daemon = True
     thread.start()
+
 
     import asyncio
     import telegram as tg
