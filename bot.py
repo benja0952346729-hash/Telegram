@@ -85,8 +85,8 @@ def build_numbers_text(data: dict) -> str:
         lines = []
         for idx, num in enumerate(slot["numbers"]):
             if idx == 0 and slot["owner"]:
-                paid_mark = "✅" if slot["paid"] else "⏳"
-                lines.append(f"{num:02d}# {slot['first_name']} {paid_mark}")
+                paid_mark = " ✅" if slot["paid"] else ""
+                lines.append(f"{num:02d}# {slot['first_name']}{paid_mark}")
             else:
                 lines.append(f"{num:02d}#")
         groups.append("\n".join(lines))
@@ -116,6 +116,7 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 Rules:
 - intent = "book" ← ሰው ቁጥር ሊይዝ/ሊመዘገብ ከፈለገ (ያዝ፣ ይያዛልኝ፣ እፈልጋለሁ፣ register፣ ቁጥር ብቻ ሲፅፍ)
   ⚠️ "ትላንት"፣ "ነበር"፣ "ባለፈ"፣ "በፊት"፣ "ቀድሞ" ካለ → "book" አይሁን (past ማለት ነው) — ግን ሁለቱ ካሉ ለምሳሌ "ትላንት አልያዝኩም ዛሬ 10 ያዝልኝ" → "book" ይሁን
+  ⚠️ ጥያቄ ምልክት (?) ካለ ወይም "ያስከልኝ?"፣ "ተይዟል?"፣ "ነፃ ነው?"፣ "ይቀራል?"፣ "አለ?" ካለ → "question" ይሁን እንጂ "book" አይሁን
 - intent = "cancel" ← ሰው ቁጥር ሊሰርዝ/ሊያስቀር ከፈለገ (አልፈልግም፣ ሰርዝ፣ አስቀር፣ cancel፣ ይሰረዝልኝ)
 - intent = "payment" ← ሰው ብር ልኳል/ከፍሏል ሲል (ብር ልኬ፣ ከፈልኩ፣ ገቢ አደረጉ፣ ገቢ ላክሁ፣ ብር ቁጥር ብቻ ሲፅፍ ለምሳሌ 400 ወይም 800)
 - intent = "question" ← ጥያቄ ከሆነ
@@ -317,6 +318,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             paid_mark = "✅" if s["paid"] else "⏳"
             taken_list.append(f"{s['numbers'][0]}-{s['numbers'][4]} ({s['first_name']} {paid_mark})")
 
+    board_text = build_numbers_text(data)
+
     context_info = (
         f"የሎተሪ ሁኔታ:\n"
         f"- ተይዘዋል: {filled}/20 slots\n"
@@ -326,7 +329,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\n"
         f"የሎተሪ ዋጋ: 400 ብር (ግማሽ 200 ብር)\n"
         f"ሽልማቶች: 1ኛ 5000 ብር 🥇, 2ኛ 1000 ብር 🥈, 3ኛ 400 ብር 🥉\n"
-        f"ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729"
+        f"ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729\n"
+        f"\nBoard (አሁናዊ ሁኔታ):\n{board_text}"
     )
 
     # ── AI intent parse ──
@@ -416,11 +420,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["slots"][slot_id]["owner"] = None
         data["slots"][slot_id]["first_name"] = None
         data["slots"][slot_id]["paid"] = False
+
+        # payments ውስጥ 400 ቀንስ
+        user_id = str(update.effective_user.id)
+        if "payments" not in data:
+            data["payments"] = {}
+        prev = data["payments"].get(user_id, 0)
+        new_total = max(0, prev - 400)
+        data["payments"][user_id] = new_total
         save_data(data)
 
         await update_lottery_message(context.bot, data)
         await update.message.reply_text(
-            f"🗑️ {owner_name} — ቁጥር {number} slot ተሰርዟል።\nቁጥሩ አሁን ነፃ ነው! 🔓"
+            f"🗑️ {owner_name} — ቁጥር {number} slot ተሰርዟል። ቁጥሩ አሁን ነፃ ነው! 🔓\n"
+            f"💰 ቀሪ ገቢ: {new_total:,} ብር"
         )
         return
 
@@ -451,13 +464,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for s in booked:
                 all_nums += s["numbers"]
             nums_str = "  ".join([f"{n:02d}#" for n in all_nums])
+            # payments tracking ውስጥ ጨምር
+            user_id = str(update.effective_user.id)
+            if "payments" not in data:
+                data["payments"] = {}
+            prev = data["payments"].get(user_id, 0)
+            grand_total = prev + total_price
+            data["payments"][user_id] = grand_total
+            save_data(data)
+
             reply_parts.append(
-                f"✅ {display_name} ቁጥሮቻቸው:\n{nums_str}\n\n"
-                f"💰 {total_price} ብር ከፍለህ/ሽ slot ህን/ሽን አረጋግጥ!\n\n"
-                f"🏦 CBE: 1000641057146\n"
-                f"🏦 አዋሽ: 01335630641400\n"
-                f"🏦 ዳሽን: 5389857825011\n"
-                f"📱 ቴሌ ብር: 0952346729"
+                f"እሺ {grand_total:,} ብር ገቢ 🙏"
             )
             await update_lottery_message(context.bot, data)
 
