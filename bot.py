@@ -135,7 +135,7 @@ def ask_addis_ai(prompt: str, context_info: str) -> str:
                     "maxOutputTokens": 300
                 }
             },
-            timeout=15
+            timeout=30
         )
         data = response.json()
         result = data.get("response_text", None)
