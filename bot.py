@@ -148,8 +148,10 @@ def build_full_state_for_ai(data: dict) -> str:
 
 def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
     for attempt in range(2):
+        key = get_next_gemini_key()
+        key_preview = key[:8] + "..." if key else "None"
         try:
-            client = genai.Client(api_key=get_next_gemini_key())
+            client = genai.Client(api_key=key)
             response = client.models.generate_content(
                 model="gemini-1.5-flash",
                 contents=prompt,
@@ -158,11 +160,24 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) ->
                     temperature=temperature,
                 )
             )
+            print(f"✅ Gemini OK (key: {key_preview})")
             return response.text.strip()
         except Exception as e:
-            print(f"❌ Gemini error (attempt {attempt + 1}): {e}")
-            if attempt == 1:
-                return ""
+            err = str(e)
+            if "API_KEY_INVALID" in err or "API key not valid" in err:
+                reason = "❌ API Key ትክክል አይደለም"
+            elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+                reason = "❌ Quota ተጠቀሰ — key limit ደረሰ"
+            elif "PERMISSION_DENIED" in err:
+                reason = "❌ Permission የለም — key ተሰናክሏል"
+            elif "UNAVAILABLE" in err or "503" in err:
+                reason = "❌ Gemini server አይሰራም — ቆይቶ ሞክር"
+            elif "timeout" in err.lower():
+                reason = "❌ Timeout — Gemini ዘግይቷል"
+            else:
+                reason = f"❌ ያልታወቀ error: {err}"
+            print(f"⚠️ Gemini attempt {attempt+1} (key: {key_preview}): {reason}")
+    print("🔴 Gemini ሙሉ በሙሉ አልሰራም — ሁሉም attempts ከሸፉ")
     return ""
 
 # ==================== AI BRAIN ====================
