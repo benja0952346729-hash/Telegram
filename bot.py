@@ -349,15 +349,29 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def update_lottery_message(bot: Bot, data: dict):
-    if data.get("lottery_message_id") and data.get("chat_id"):
+    msg_id = data.get("lottery_message_id")
+    chat_id = data.get("chat_id")
+    print(f"🔄 update_lottery_message: chat_id={chat_id}, message_id={msg_id}")
+    if msg_id and chat_id:
         try:
             await bot.edit_message_text(
-                chat_id=data["chat_id"],
-                message_id=data["lottery_message_id"],
+                chat_id=chat_id,
+                message_id=msg_id,
                 text=build_full_message(data)
             )
+            print("✅ Lottery message updated successfully")
         except Exception as e:
-            print(f"Message update error: {e}")
+            print(f"❌ Message update error: {e}")
+            # ✅ FIX: edit fail ከሆነ አዲስ message ልካ
+            try:
+                sent = await bot.send_message(chat_id=chat_id, text=build_full_message(data))
+                data["lottery_message_id"] = sent.message_id
+                save_data(data)
+                print(f"✅ Sent new lottery message id={sent.message_id}")
+            except Exception as e2:
+                print(f"❌ Send new message error: {e2}")
+    else:
+        print("⚠️ No lottery_message_id or chat_id — cannot update")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -429,6 +443,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "p2_id": None,    "p2_name": None,          "p2_paid": False,
                     })
                     booked_full.append(number)
+                elif slot["p1_id"] == user_id or slot["p2_id"] == user_id:
+                    # ✅ FIX: ተጠቃሚ ቀድሞ ይህን slot ይዟል
+                    await update.message.reply_text(f"⚠️ {number}# ቁጥር ቀድሞ ይዘሃል!")
                 else:
                     name = slot["p1_name"]
                     already_full.append((number, name))
@@ -438,16 +455,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update_lottery_message(context.bot, data)
 
         if booked_full:
-            slots_count = sum(1 for s in data["slots"].values() if s["p1_id"] == user_id and s["type"] == "full")
-            half_count  = sum(1 for s in data["slots"].values() if (s["p1_id"] == user_id or s["p2_id"] == user_id) and s["type"] == "half")
-            total = slots_count * 400 + half_count * 200
-            await update.message.reply_text(f"✅ ቁጥር ተይዟል! {total} ብር ገቢ 🙏")
+            await update.message.reply_text(f"እሺ ገቢ {len(booked_full) * 400}ብር 🙏")
 
         if booked_half:
-            nums_str = ", ".join(str(n) for n in booked_half)
-            await update.message.reply_text(
-                f"✅ {nums_str}# ግማሽ ተይዟል (200 ብር)! ሌላ ሰው ሊቀላቀል ይችላል 🤝"
-            )
+            await update.message.reply_text("እሺ ገቢ 200ብር 🙏")
 
         if half_joined:
             nums_str = ", ".join(str(n) for n in half_joined)
