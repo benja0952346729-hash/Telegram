@@ -3,6 +3,7 @@ import re
 import json
 import base64
 import threading
+import time
 import requests
 import psutil
 import psycopg2
@@ -158,7 +159,7 @@ def build_progress_bar(percent: float, width: int = 10) -> str:
 def build_804_report() -> str:
     rows = get_usage_last_5_days()
     metrics = get_system_metrics()
-    gemini_daily_limit = len([k for k in GEMINI_KEYS if k]) * 1000
+    gemini_daily_limit = len([k for k in GEMINI_KEYS if k]) * 1500
 
     lines = ["📊 *Bot Resource Report*", ""]
 
@@ -573,38 +574,52 @@ def get_next_gemini_key() -> str:
     gemini_key_index += 1
     return key
 
+GEMINI_MODELS = [
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-2.0-flash",
+]
+
 def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
     last_error = None
-    for attempt in range(len(GEMINI_KEYS)):
-        key = get_next_gemini_key()
-        try:
-            response = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={key}",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "temperature": temperature,
-                        "maxOutputTokens": max_tokens
-                    }
-                },
-                timeout=20
-            )
-            if response.status_code == 429:
-                print(f"⚠️ Gemini key {attempt+1} rate limited, trying next...")
-                last_error = "429"
+    # ሁሉም keys × ሁሉም models እንሞክር
+    for model in GEMINI_MODELS:
+        for attempt in range(len(GEMINI_KEYS)):
+            key = get_next_gemini_key()
+            try:
+                response = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": temperature,
+                            "maxOutputTokens": max_tokens
+                        }
+                    },
+                    timeout=20
+                )
+                if response.status_code == 429:
+                    print(f"⚠️ Gemini {model} key {attempt+1} rate limited, trying next...")
+                    last_error = "429"
+                    time.sleep(0.3)
+                    continue
+                if response.status_code != 200:
+                    print(f"⚠️ Gemini {model} key {attempt+1} error {response.status_code}")
+                    last_error = str(response.status_code)
+                    continue
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                print(f"✅ Gemini response ({model}, key {attempt+1}): {text[:80]}")
+                increment_counter("gemini_calls")
+                return text
+            except Exception as e:
+                print(f"❌ Gemini call error ({model}, key {attempt+1}): {e}")
+                last_error = str(e)
+                increment_counter("errors")
                 continue
-            data = response.json()
-            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-            print(f"✅ Gemini response (key {attempt+1}): {text[:80]}")
-            increment_counter("gemini_calls")
-            return text
-        except Exception as e:
-            print(f"❌ Gemini call error (key {attempt+1}): {e}")
-            last_error = str(e)
-            increment_counter("errors")
-            continue
-    print(f"❌ All Gemini keys failed: {last_error}")
+        print(f"⚠️ All keys failed for {model}, trying next model...")
+    print(f"❌ All Gemini models and keys failed: {last_error}")
     return ""
 
 def extract_numbers_from_text(text: str) -> list:
