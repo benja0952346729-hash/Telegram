@@ -75,7 +75,6 @@ def init_db():
                     numbers TEXT NOT NULL
                 )
             """)
-            # ── Resource tracking table ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS resource_usage (
                     id SERIAL PRIMARY KEY,
@@ -99,7 +98,6 @@ def init_db():
 # ==================== RESOURCE TRACKING ====================
 
 def increment_counter(column: str, amount: int = 1):
-    """አንድ counter ይጨምራል — background thread safe"""
     def _inc():
         conn = get_conn()
         try:
@@ -164,7 +162,6 @@ def build_804_report() -> str:
 
     lines = ["📊 *Bot Resource Report*", ""]
 
-    # ── System ──
     if metrics:
         lines.append("🖥 *System — አሁን*")
         lines.append(f"  Bot RAM:  `{metrics.get('bot_ram_mb')} MB`")
@@ -172,7 +169,6 @@ def build_804_report() -> str:
         lines.append(f"  Sys RAM:  `{metrics.get('sys_ram_used')} / {metrics.get('sys_ram_total')} MB ({metrics.get('sys_ram_pct')}%)`")
         lines.append("")
 
-    # ── Gemini today ──
     if rows:
         today = rows[0]
         gemini_today = today[1] or 0
@@ -188,7 +184,6 @@ def build_804_report() -> str:
         lines.append(f"  ጥቅም: `{groq_today}` calls")
         lines.append("")
 
-    # ── 5 ቀን table ──
     lines.append("📅 *የ 5 ቀን Usage*")
     lines.append("```")
     lines.append(f"{'ቀን':<10} {'Gem':>5} {'Groq':>5} {'Msg':>5} {'📷':>4} {'SMS':>4} {'✅':>4} {'❌':>4}")
@@ -208,8 +203,6 @@ def build_804_report() -> str:
 
     lines.append("```")
     lines.append("")
-
-    # ── Legend ──
     lines.append("_Gem=Gemini | Groq=Groq | Msg=Messages_")
     lines.append("_📷=Photos | SMS=SMS | ✅=AutoApproved | ❌=Errors_")
     lines.append("")
@@ -551,10 +544,7 @@ FT የሚጀምር code ነው። ምሳሌ: FT26147TDW1K
         result = response.json()
         text = result["choices"][0]["message"]["content"].strip()
         print(f"🔍 Groq extracted: {text}")
-
-        # ✅ Count Groq call
         increment_counter("groq_calls")
-
         match = re.search(r'[A-Z]{2}[A-Z0-9]{6,15}', text)
         return match.group(0) if match else None
     except Exception as e:
@@ -607,10 +597,7 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) ->
             data = response.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
             print(f"✅ Gemini response (key {attempt+1}): {text[:80]}")
-
-            # ✅ Count Gemini call
             increment_counter("gemini_calls")
-
             return text
         except Exception as e:
             print(f"❌ Gemini call error (key {attempt+1}): {e}")
@@ -653,6 +640,7 @@ def build_context_info(data: dict) -> str:
     lines = [
         f"አጠቃላይ: {filled}/20 slots ሞልቷል",
         f"ነፃ slots: {len(free_slots)} | ግማሽ ክፍት: {len(half_open)}",
+        f"ነፃ ቁጥሮች ብዛት: {len(free_slots) * 5}",
         "",
         "=== እያንዳንዱ slot ሁኔታ ===",
     ]
@@ -676,38 +664,72 @@ def build_context_info(data: dict) -> str:
         lines.append("\n✅ ሁሉም slots ተሞልቷል!")
     return "\n".join(lines)
 
+# ==================== AI BRAIN (IMPROVED PROMPT) ====================
+
 def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
              last_numbers: list = None, free_numbers: list = None) -> dict:
-    prompt = f"""አንተ ልምድ ያለው የሎተሪ bot ነህ። ሰዎችን በትክክል ማስተናገድ ዋና ተልዕኮህ ነው።
-JSON ብቻ መልስ። ምንም ሌላ ቃል፣ ማብራሪያ፣ ወይም ሰላምታ አትጨምር።
+
+    prompt = f"""አንተ ልምድ ያለው የሎተሪ ረዳት ነህ። ሰዎችን ያለ admin ሙሉ በሙሉ ማስተናገድ ይኖርብሃል።
+JSON ብቻ መልስ። ምንም markdown፣ backtick፣ ወይም ሌላ text አታክል።
 
 ══════════════════════════════
-🔴 ጠንካራ ክልከላዎች — ፈጽሞ አትጥስ
+🎰 ጨዋታው እንዴት ነው? (ሙሉ እውቀት)
 ══════════════════════════════
-❌ ራስህን절대 አታስተዋውቅ ("አዲስ ረዳት ነኝ"፣ "ቦት ነኝ"፣ "ስሜ..." — ፈጽሞ አትበል)
-❌ "ምን ልርዳዎት?" "እንዴት ልረዳ?" አትጠይቅ — ቀጥታ መልስ ስጥ
-❌ context_info ሳትጠቀም "አላውቅም" አትበል — መልሱ ሁልጊዜ context ውስጥ አለ
-❌ ያልጠየቁትን ነገር አትጨምር
-❌ አጭር ትክክለኛ መልስ ብቻ — ረጅም ማብራሪያ አያስፈልግም
+- ጠቅላላ 20 slots አሉ፣ እያንዳንዱ slot 5 ቁጥሮች (1-5, 6-10, 11-15 ... 96-100)
+- ሙሉ slot = 1 ሰው 400ብር ይከፍላል፣ 5 ቁጥሮቹን ሙሉ ለሙሉ ይወስዳል
+- ግማሽ slot = 2 ሰው ይካፈላሉ፣ እያንዳንዱ 200ብር ይከፍላል፣ ቁጥሮቹን አብረው ይያዛሉ
+- ሁሉም 20 slots ሲሞሉ ዕጣ ይወጣል
+- ሽልማቶች: 1ኛ=5000ብር | 2ኛ=1000ብር | 3ኛ=400ብር
+- ክፍያ ዘዴዎች: CBE 1000641057146 | አዋሽ 01335630641400 | ዳሽን 5389857825011 | ቴሌ ብር 0952346729
+- ቁጥር ከያዙ በኋላ → ክፍያ ይፈጸማል → screenshot ይላካል → admin ያረጋግጣል → ✅
 
 ══════════════════════════════
-💰 ዋጋ እና ስሌት
+🗣️ አንተ እንዴት ትናገራለህ?
 ══════════════════════════════
-ሙሉ slot = 400ብር (5 ቁጥሮች፣ 1 ሰው)
-ግማሽ slot = 200ብር (5 ቁጥሮች፣ 2 ሰው ይካፈላሉ)
-
-"አጠቃላይ ስንት ብር?" → context_info ውስጥ ስንት slots ያዘ ተቆጥሮ × 400 ወይም × 200 ተሰልቶ መልስ
-"ስንት ቀርቷል?" → context_info ውስጥ ነፃ slots ቁጥር
-"ዋጋው ስንት?" → ሙሉ=400ብር፣ ግማሽ=200ብር
-"ሽልማቱ?" → 1ኛ=5000ብር፣ 2ኛ=1000ብር፣ 3ኛ=400ብር
+- ሰዎችን ሞቅ ባለ፣ ቀላል አማርኛ ታናግራቸዋለህ
+- ጥያቄ ሲጠይቁ context ተጠቅመህ ሙሉ፣ ጠቃሚ፣ አጭር መልስ ትሰጣለህ
+- ካልገባቸው ታብራራለህ፣ ካጠራጠሩ ትረዳቸዋለህ
+- "ልረዳህ አልቻልኩም" ፈጽሞ አትበል — context ውስጥ መልሱ ሁልጊዜ አለ
+- ራስህን አታስተዋውቅ፣ "ምን ልርዳህ?" አትጠይቅ — ቀጥታ መልስ ስጥ
 
 ══════════════════════════════
-🌐 ቋንቋ ማወቅ
+🌐 ቋንቋ ማወቅ — Latin አማርኛ ሁሉ ተረዳ
 ══════════════════════════════
-ሰዎች አማርኛን በ Latin ፊደልም ይፅፋሉ። ሁሉንም ተረዳ፦
-"yaz" = ያዝ | "srez" = ሰርዝ | "gmash/grmash" = ግማሽ | "nefta ale?" = ነፃ አለ?
-"sint bir?" = ስንት ብር? | "ale?" = አለ? | "yemeta?" = የሚቀር?
-"tekayelgn" = ተካልኝ | "endet" = እንዴት | "mecheresha" = ምን ያህል
+yaz/yazlgn = ያዝልኝ | srez/sirez = ሰርዝ | gmash/grmash/begmash = ግማሽ
+nefta ale = ነፃ አለ? | sint bir = ስንት ብር? | yemeta = የቀረ? | ale = አለ?
+tekayelgn = ተካልኝ | endet = እንዴት | mecheresha = ምን ያህል
+hulum = ሁሉም | kefelku = ከፈልኩ | screenshot = ስክሪንሾት
+
+══════════════════════════════
+💬 ጥያቄ ሲመጣ — ትክክለኛ መልሶች
+══════════════════════════════
+"ቁጥሮች አሉ?" / "ነፃ አለ?" / "nefta ale?" / "ቁጥር አለ?"
+→ context_info ውስጥ ነፃ slots ቁጥር ተጠቀም። "አዎ X ቁጥሮች ነፃ አሉ ✅" ወይም "ሁሉም ተይዟል ❌"
+
+"ስንት ቀርቷል?" / "yemeta?" / "ስንት ነፃ ነው?"
+→ ነፃ slots × 5 ቁጥሮች ስሌት ተጠቀም
+
+"ዋጋው ስንት?" / "sint bir?"
+→ "ሙሉ=400ብር (5 ቁጥሮች)፣ ግማሽ=200ብር (5 ቁጥሮች 2 ሰው ይካፈላሉ)"
+
+"ሽልማቱ ስንት?" / "ena zer"
+→ "1ኛ=5000ብር 🥇 | 2ኛ=1000ብር 🥈 | 3ኛ=400ብር 🥉"
+
+"እንዴት ነው ጨዋታው?" / "explain" / "እንዴት?"
+→ ጨዋታውን አጭር ቢሆን ሙሉ ማብራሪያ ስጥ፦ ቁጥር ምረጥ → ክፈል → screenshot ላክ → ዕጣ ጠብቅ
+
+"ስንት ሰው ነው?" / "for how many?"
+→ "20 ሰው ብቻ ነው። አሁን X slot ቀርቷል 🎰"
+
+"እኔ ቁጥር ይዣለሁ?" / "yaze ale?"
+→ context_info ውስጥ ሰውዬው ስም ፈልግ። ካለ "አዎ [ቁጥር] ይዘሃል"። ከሌለ "ቁጥር ገና አልያዝክም"
+
+"ክፍያ እንዴት?" / "payment"
+→ "ቁጥር ከያዙ ወደ ታች ወዳሉት bank account ይክፈሉ፣ screenshot ያንዱ ወደ bot ይላኩ።
+   CBE: 1000641057146 | አዋሽ: 01335630641400 | ዳሽን: 5389857825011 | ቴሌ ብር: 0952346729"
+
+"ሰላም" / "hi" / "hello"
+→ "ሰላም {sender_first_name}! 🎰 ቁጥር ይያዙ — {len([s for s in context_info.split(chr(10)) if 'ነፃ ✅' in s])} slot ነፃ አለ!"
 
 ══════════════════════════════
 ⚡ Actions (valid=true)
@@ -715,12 +737,12 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል፣ ማብራሪያ፣ ወይም
 1. book — ቁጥር መያዝ
    ቁጥር ብቻ → is_half=false
    ቁጥር+ ወይም "ግማሽ/gmash/200" → is_half=true
-   "ያዝልኝ/አዎ/እሺ" ቁጥር ሳይኖር → last_numbers ተጠቀም: {last_numbers if last_numbers else "[]"}
-   "ሁሉንም/ቀሪውን ያዝልኝ" → free_numbers: {free_numbers if free_numbers else "[]"}
+   "ያዝልኝ/yazlgn/አዎ/እሺ/ishi" ቁጥር ሳይኖር → last_numbers ተጠቀም: {last_numbers if last_numbers else "[]"}
+   "ሁሉንም/hulum/ቀሪውን ያዝልኝ" → free_numbers: {free_numbers if free_numbers else "[]"}
    ሌላ ሰው ስም ካለ → name field ሙላ
 
 2. cancel — ቁጥር መሰረዝ
-   "ሰርዝ/ሰርዘኝ/cancel/yikar/ይቅር" + ቁጥር
+   "ሰርዝ/srez/sirez/cancel/yikar/ይቅር" + ቁጥር
 
 3. change_type — slot አይነት መቀየር
    "X ወደ ግማሽ ቀይር" → new_type="half"
@@ -731,53 +753,43 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል፣ ማብራሪያ፣ ወይም
    cancel_number + book_numbers list
 
 ══════════════════════════════
-💬 ጥያቄዎች (valid=false + reply)
-══════════════════════════════
-ጥያቄ ሲመጣ context_info ተጠቅምህ ትክክለኛ፣ አጭር፣ ጠቃሚ መልስ ስጥ።
-reply አማርኛ ብቻ፣ 1-2 ዓረፍተነገር።
-
-ምሳሌ ጥያቄዎችና ትክክለኛ መልሶቻቸው፦
-"ቁጥሮች አሉ?" → context ውስጥ ነፃ slots ቁጥር ተጠቅሞ "አዎ X ቁጥሮች ነፃ አሉ ✅" ወይም "የለም ሁሉም ተይዟል ❌"
-"ቁጥር አለ?" / "nefta ale?" / "ነፃ አለ?" → ቀጥታ ቀጥታ መልስ
-"ቁጥር አልቋል?" / "yemeta?" / "ስንት ቀርቷል?" → ቀሪ slots ቁጥር ቀጥታ
-"ሰላም" → "ሰላም {sender_first_name}! ቁጥር ይያዙ 🎰"
-"ዋጋው ስንት?" → "ሙሉ=400ብር፣ ግማሽ=200ብር"
-"ሽልማቱ?" → "1ኛ=5000ብር፣ 2ኛ=1000ብር፣ 3ኛ=400ብር"
-"ምን ያህል ሰው ነው?" → "20 ሰው ብቻ ነው"
-
-══════════════════════════════
-📊 አሁናዊ ሁኔታ (context)
+📊 አሁናዊ ሁኔታ
 ══════════════════════════════
 {context_info}
 
 ══════════════════════════════
-👤 ላኪ
+👤 ላኪ መረጃ
 ══════════════════════════════
 ስም: {sender_first_name}
 መልእክት: "{raw_text}"
 
 ══════════════════════════════
-📋 JSON Output Format
+📋 JSON Output — ይህን format ብቻ ተጠቀም
 ══════════════════════════════
-Action ሲሆን (valid=true):
+Action ሲሆን:
 {{"actions": [{{"intent": "book", "number": 21, "is_half": false, "name": null}}], "valid": true, "reply": null}}
 
 swap ሲሆን:
-{{"actions": [{{"intent": "swap", "cancel_number": 41, "book_numbers": [31, 41], "is_half": true, "name": null}}], "valid": true, "reply": null}}
+{{"actions": [{{"intent": "swap", "cancel_number": 41, "book_numbers": [31], "is_half": false, "name": null}}], "valid": true, "reply": null}}
 
 change_type ሲሆን:
 {{"actions": [{{"intent": "change_type", "number": 21, "new_type": "half"}}], "valid": true, "reply": null}}
 
-ጥያቄ ሲሆን (valid=false):
-{{"actions": [], "valid": false, "reply": "ትክክለኛ አጭር መልስ አማርኛ"}}
+ጥያቄ/ማብራሪያ ሲሆን:
+{{"actions": [], "valid": false, "reply": "አጭር፣ ጠቃሚ፣ ሙሉ መልስ አማርኛ — ቢበዛ 3 ዓረፍተነገር"}}
 
-JSON ብቻ። ምንም ሌላ ቃል አታክል።"""
+⚠️ አስፈላጊ:
+- JSON ብቻ። ምንም backtick፣ markdown፣ ወይም ሌላ text አታክል
+- reply ሁልጊዜ አማርኛ ብቻ
+- context_info ሳትጠቀም "አላውቅም" ወይም "ልረዳህ አልቻልኩም" ፈጽሞ አትበል"""
 
     result = gemini_call(prompt, max_tokens=500, temperature=0.1)
     print(f"🧠 AI brain raw: {result}")
 
     try:
-        match = re.search(r'\{.*\}', result, re.DOTALL)
+        # JSON ከ markdown backtick ካለ አስወግድ
+        clean = re.sub(r'```(?:json)?', '', result).strip().rstrip('`').strip()
+        match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
@@ -792,7 +804,7 @@ JSON ብቻ። ምንም ሌላ ቃል አታክል።"""
             "valid": True,
             "reply": None
         }
-    return {"actions": [], "valid": False, "reply": "❓ ልረዳህ አልቻልኩም። ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
+    return {"actions": [], "valid": False, "reply": "❓ ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
 
 # ==================== BOT HANDLERS ====================
 
@@ -850,10 +862,7 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_lottery_message(context.bot, data)
     await update.message.reply_text(f"✅ {name} ክፍያ ተረጋግጧል!")
 
-# ==================== /804 ADMIN REPORT ====================
-
 async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin /804 ሲል resource report ይላካል"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
         return
@@ -895,7 +904,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # ✅ Count photo
     increment_counter("photos_handled")
 
     pending = get_pending_payment(user_id)
@@ -986,7 +994,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== PAYMENT: ADMIN SMS HANDLER ====================
 
 async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    # ✅ Count SMS
     increment_counter("sms_received")
 
     await update.message.reply_text("⏳ CBE receipt እየተረጋገጠ ነው...")
@@ -1085,7 +1092,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = load_data()
 
-    # ✅ Count message
     increment_counter("messages_handled")
 
     # ── ADMIN: CBE SMS forward ──
@@ -1110,7 +1116,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = brain.get("reply", None)
 
         if not valid or not brain.get("actions"):
-            await update.message.reply_text(reply or "❓ ልረዳህ አልቻልኩም።")
+            await update.message.reply_text(reply or "❓ ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።")
             return
 
         actions = brain.get("actions", [])
@@ -1507,7 +1513,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start_lottery", start_lottery))
     app.add_handler(CommandHandler("paid", mark_paid))
-    app.add_handler(CommandHandler("804", admin_report))        # ✅ /804 command
+    app.add_handler(CommandHandler("804", admin_report))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
