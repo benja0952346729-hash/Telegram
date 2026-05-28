@@ -4,7 +4,10 @@ import json
 import base64
 import threading
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import psycopg2
+import psycopg2.extras
+from psycopg2 import pool
+from flask import Flask, request as flask_request, jsonify
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
@@ -12,8 +15,58 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DATA_FILE = "lottery_data.json"
-PAYMENTS_FILE = "payments.json"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ==================== DATABASE ====================
+
+db_pool = pool.SimpleConnectionPool(1, 10, DATABASE_URL)
+
+def get_conn():
+    return db_pool.getconn()
+
+def release_conn(conn):
+    db_pool.putconn(conn)
+
+def init_db():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments (
+                    id SERIAL PRIMARY KEY,
+                    ref TEXT UNIQUE NOT NULL,
+                    amount FLOAT DEFAULT 0,
+                    sender TEXT,
+                    used BOOLEAN DEFAULT FALSE,
+                    used_by BIGINT,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    user_id BIGINT PRIMARY KEY,
+                    slot_id TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    booking_type TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lottery_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_last_numbers (
+                    user_id BIGINT PRIMARY KEY,
+                    numbers TEXT NOT NULL
+                )
+            """)
+        conn.commit()
+        print("✅ Database tables ready")
+    finally:
+        release_conn(conn)
 
 ADDIS_AI_KEYS = [
     os.getenv("ADDIS_AI_API_KEY_1"),
@@ -53,63 +106,81 @@ CBE 1000641057146 biniyam dawit
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
 
-# ==================== PAYMENTS DATA ====================
+# ==================== PAYMENTS DATA (PostgreSQL) ====================
 
-def load_payments() -> dict:
-    if os.path.exists(PAYMENTS_FILE):
-        with open(PAYMENTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"verified": {}, "pending": {}}
-
-def save_payments(data: dict):
-    with open(PAYMENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def save_verified_payment(ref: str, amount: float, sender: str):
-    """Admin SMS forward ሲመጣ ref ያስቀምጣል"""
-    payments = load_payments()
-    if ref not in payments["verified"]:
-        payments["verified"][ref] = {
-            "amount": amount,
-            "sender": sender,
-            "used": False,
-            "used_by": None
-        }
-        save_payments(payments)
-        print(f"✅ Payment saved: ref={ref}, amount={amount}")
-        return True
-    return False  # Already exists
+def save_verified_payment(ref: str, amount: float, sender: str) -> bool:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO payments (ref, amount, sender)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (ref) DO NOTHING
+            """, (ref, amount, sender))
+            inserted = cur.rowcount > 0
+        conn.commit()
+        if inserted:
+            print(f"✅ Payment saved: ref={ref}, amount={amount}")
+        return inserted
+    finally:
+        release_conn(conn)
 
 def find_verified_payment(ref: str) -> dict:
-    payments = load_payments()
-    return payments["verified"].get(ref)
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM payments WHERE ref = %s", (ref,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 def mark_payment_used(ref: str, user_id: int):
-    payments = load_payments()
-    if ref in payments["verified"]:
-        payments["verified"][ref]["used"] = True
-        payments["verified"][ref]["used_by"] = user_id
-        save_payments(payments)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE payments SET used = TRUE, used_by = %s WHERE ref = %s
+            """, (user_id, ref))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def save_pending_payment(user_id: int, slot_id: str, amount: int, booking_type: str):
-    """User ቁጥር ሲይዝ pending payment ያስቀምጣል"""
-    payments = load_payments()
-    payments["pending"][str(user_id)] = {
-        "slot_id": slot_id,
-        "amount": amount,
-        "type": booking_type
-    }
-    save_payments(payments)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pending_payments (user_id, slot_id, amount, booking_type)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    slot_id = EXCLUDED.slot_id,
+                    amount = EXCLUDED.amount,
+                    booking_type = EXCLUDED.booking_type,
+                    created_at = NOW()
+            """, (user_id, slot_id, amount, booking_type))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def get_pending_payment(user_id: int) -> dict:
-    payments = load_payments()
-    return payments["pending"].get(str(user_id))
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM pending_payments WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
 def clear_pending_payment(user_id: int):
-    payments = load_payments()
-    if str(user_id) in payments["pending"]:
-        del payments["pending"][str(user_id)]
-        save_payments(payments)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pending_payments WHERE user_id = %s", (user_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 # ==================== DATA MANAGEMENT ====================
 
@@ -122,19 +193,68 @@ def make_empty_slot(i: int) -> dict:
         "p2_id": None, "p2_name": None, "p2_paid": False,
     }
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        if "last_numbers_per_user" not in d:
-            d["last_numbers_per_user"] = {}
-        return d
-    slots = {str(i): make_empty_slot(i) for i in range(1, 21)}
-    return {"slots": slots, "lottery_message_id": None, "chat_id": None, "last_numbers_per_user": {}}
+def load_data() -> dict:
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # lottery_state ያነባል
+            cur.execute("SELECT key, value FROM lottery_state")
+            rows = {r["key"]: r["value"] for r in cur.fetchall()}
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+            # slots
+            slots_json = rows.get("slots")
+            if slots_json:
+                slots = json.loads(slots_json)
+            else:
+                slots = {str(i): make_empty_slot(i) for i in range(1, 21)}
+
+            # last_numbers_per_user
+            cur.execute("SELECT user_id, numbers FROM user_last_numbers")
+            last_numbers = {str(r["user_id"]): json.loads(r["numbers"]) for r in cur.fetchall()}
+
+            return {
+                "slots": slots,
+                "lottery_message_id": int(rows["lottery_message_id"]) if rows.get("lottery_message_id") else None,
+                "chat_id": int(rows["chat_id"]) if rows.get("chat_id") else None,
+                "last_numbers_per_user": last_numbers
+            }
+    finally:
+        release_conn(conn)
+
+def save_data(data: dict):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            # slots save
+            cur.execute("""
+                INSERT INTO lottery_state (key, value) VALUES ('slots', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (json.dumps(data["slots"], ensure_ascii=False),))
+
+            # message_id save
+            if data.get("lottery_message_id"):
+                cur.execute("""
+                    INSERT INTO lottery_state (key, value) VALUES ('lottery_message_id', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (str(data["lottery_message_id"]),))
+
+            # chat_id save
+            if data.get("chat_id"):
+                cur.execute("""
+                    INSERT INTO lottery_state (key, value) VALUES ('chat_id', %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                """, (str(data["chat_id"]),))
+
+            # last_numbers_per_user save
+            for uid, nums in data.get("last_numbers_per_user", {}).items():
+                cur.execute("""
+                    INSERT INTO user_last_numbers (user_id, numbers) VALUES (%s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET numbers = EXCLUDED.numbers
+                """, (int(uid), json.dumps(nums)))
+
+        conn.commit()
+    finally:
+        release_conn(conn)
 
 def is_slot_free(slot: dict) -> bool:
     return slot["type"] is None
@@ -357,18 +477,44 @@ def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
 === Latin አማርኛ ===
 ሰዎች አማርኛን በ Latin ፊደል ይፅፋሉ (Ethiopic transliteration)።
 Latin ቃል ሲመጣ አማርኛ ነው — ሙሉ ፍቺውን ተረድተህ ስራ።
+ያልተዘረዘረ ቃልም ቢሆን context ተጠቅመህ ፍቺውን ተረዳ።
 
-=== Intents ===
-1. book — ቁጥር መያዝ (number, is_half, name)
-2. cancel — ቁጥር መሰረዝ (number)
-3. change_type — slot አይነት መቀየር (number, new_type)
-4. swap — ቁጥሮች መቀያየር (cancel_number, book_numbers, is_half)
+=== Intents — ሁሉንም ተረዳ ===
+bot ሊያስተናግዳቸው የሚችላቸው intents:
+
+1. book — ቁጥር መያዝ
+   - number, is_half (true/false), name (ሌላ ሰው ስም ካለ)
+   - ቁጥር ብቻ ሲላክ → book, is_half=false
+   - ቁጥር+ ወይም "ግማሽ" ሲኖር → is_half=true
+   - ቁጥር ሳይኖር "ያዝልኝ/አዎ/እሺ" → last_numbers ተጠቀም: {last_numbers if last_numbers else "የሉም"}
+   - "ሁሉንም/ቀሪ ያዝልኝ" → free_numbers ሁሉ book: {free_numbers if free_numbers else "የሉም"}
+
+2. cancel — ቁጥር መሰረዝ
+   - number
+
+3. change_type — slot አይነት መቀየር
+   - number, new_type ("full" ወይም "half")
+   - "X ወደ ግማሽ ቀይር" → change_type, new_type="half"
+   - "X ወደ ሙሉ ቀይር" → change_type, new_type="full"
+
+4. swap — ቁጥሮች መቀያየር/መቀናበር
+   - cancel_number (የሚሰረዘው), book_numbers (የሚያዙት list), is_half
+   - "31+ እና 41+ ተካልኝ 41 ይቅር" → cancel 41, book 31+ እና 41+
+   - "X ሰርዘህ Y ያዝልኝ" → swap
+
+=== ጥያቄ vs Action ===
+ሰው action እንደፈለገ ግልጽ ከሆነ → valid=true
+ጥያቄ / information request / statement ከሆነ → valid=false + reply (አማርኛ፣ አጭር)
+
+ጥያቄ መለየት:
+- "X አለ?" / "X new?" / "X ale?" / "X alegn?" → ጥያቄ
+- "ስንት ቀርቷል?" / "ዋጋው?" / "ሽልማቱ?" / "ሰላም" → ጥያቄ/ሰላምታ
+- context_info ተጠቅመህ ትክክለኛ መልስ ስጥ
+
+ዋናው መርህ: ሰው ምን እንደሚፈልግ ሙሉ context ተረድተህ ወስን — ምሳሌ ሳትጠብቅ።
 
 === አሁናዊ ሁኔታ ===
 {context_info}
-
-last_numbers: {last_numbers if last_numbers else "የሉም"}
-free_numbers: {free_numbers if free_numbers else "የሉም"}
 
 === ላኪ ===
 ስም: {sender_first_name}
@@ -383,8 +529,14 @@ free_numbers: {free_numbers if free_numbers else "የሉም"}
   "reply": null
 }}
 
+swap ሲሆን:
+{{"intent": "swap", "cancel_number": 41, "book_numbers": [31, 41], "is_half": true, "name": null}}
+
+change_type ሲሆን:
+{{"intent": "change_type", "number": 21, "new_type": "half"}}
+
 valid=false → reply=አማርኛ | valid=true → reply=null
-JSON ብቻ።"""
+JSON ብቻ። ምንም ማብራሪያ አታክል።"""
 
     result = addis_call(prompt, max_tokens=300, temperature=0.1)
     print(f"🧠 AI brain raw: {result}")
@@ -871,37 +1023,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── REPLIES ──
     if booked_full:
-        total = len(booked_full) * 400
-        await update.message.reply_text(
-            f"እሺ ገቢ {total}ብር 🙏\n\n"
-            f"💳 CBE: 1000641057146\n"
-            f"💳 አዋሽ: 01335630641400\n"
-            f"💳 ዳሽን: 5389857825011\n"
-            f"📱 ቴሌ ብር: 0952346729\n\n"
-            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
-        )
+        await update.message.reply_text(f"እሺ ገቢ {len(booked_full) * 400}ብር 🙏")
         if last_booked_slot_id:
             save_pending_payment(user_id, last_booked_slot_id, last_booked_amount, last_booked_type)
 
     if booked_half:
-        total = len(booked_half) * 200
-        await update.message.reply_text(
-            f"እሺ ገቢ {total}ብር 🙏\n\n"
-            f"💳 CBE: 1000641057146\n"
-            f"💳 አዋሽ: 01335630641400\n"
-            f"💳 ዳሽን: 5389857825011\n"
-            f"📱 ቴሌ ብር: 0952346729\n\n"
-            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
-        )
+        await update.message.reply_text(f"እሺ ገቢ {len(booked_half) * 200}ብር 🙏")
         if last_booked_slot_id:
             save_pending_payment(user_id, last_booked_slot_id, last_booked_amount, last_booked_type)
 
     if half_joined:
-        await update.message.reply_text(
-            f"✅ ተቀላቅለሃል! slot ሙሉ ሆኗል 🎉 እሺ ገቢ 200ብር 🙏\n\n"
-            f"💳 CBE: 1000641057146\n\n"
-            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
-        )
+        await update.message.reply_text(f"✅ ተቀላቅለሃል! slot ሙሉ ሆኗል 🎉 እሺ ገቢ 200ብር 🙏")
         if last_booked_slot_id:
             save_pending_payment(user_id, last_booked_slot_id, 200, "half")
 
@@ -918,26 +1050,100 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
         await update.message.reply_text("🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
 
-# ==================== KEEP ALIVE ====================
+# ==================== FLASK SMS WEBHOOK ====================
 
-class KeepAlive(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-    def log_message(self, format, *args):
-        pass
+flask_app = Flask(__name__)
+_bot_app = None  # telegram app reference
 
-def run_server():
+@flask_app.route("/", methods=["GET"])
+def health():
+    return "Bot is running! ✅", 200
+
+@flask_app.route("/sms", methods=["POST"])
+def sms_webhook():
+    """SMS Forwarder app → ይህ endpoint ይልካል"""
+    try:
+        if flask_request.is_json:
+            payload = flask_request.get_json()
+            sms_text = payload.get("message") or payload.get("text") or payload.get("body") or ""
+        else:
+            sms_text = (
+                flask_request.form.get("message") or
+                flask_request.form.get("text") or
+                flask_request.form.get("body") or
+                flask_request.data.decode("utf-8", errors="ignore")
+            )
+
+        print(f"📩 SMS received: {sms_text[:100]}")
+
+        if "Mbreciept.cbe.com.et" in sms_text or "mbreciept.cbe.com.et" in sms_text:
+            threading.Thread(
+                target=lambda: _process_cbe_sms(sms_text),
+                daemon=True
+            ).start()
+            return jsonify({"status": "processing"}), 200
+
+        return jsonify({"status": "ignored", "reason": "not CBE SMS"}), 200
+
+    except Exception as e:
+        print(f"❌ SMS webhook error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+def _process_cbe_sms(sms_text: str):
+    """Background thread — CBE SMS ያስተናግዳል"""
+    import asyncio
+
+    link = extract_cbe_link(sms_text)
+    amount = extract_amount_from_sms(sms_text)
+    sender = extract_sender_from_sms(sms_text)
+
+    if not link:
+        print("❌ No CBE link found in SMS")
+        return
+
+    ref = fetch_ref_from_cbe_link(link)
+    if not ref:
+        print("❌ Could not extract ref from CBE link")
+        return
+
+    saved = save_verified_payment(ref, amount or 0, sender or "Unknown")
+
+    if _bot_app and ADMIN_TELEGRAM_ID:
+        async def notify():
+            if saved:
+                msg = (
+                    f"✅ አዲስ ክፍያ ተመዝግቧል!
+
+"
+                    f"📋 Ref: {ref}
+"
+                    f"💰 Amount: ETB {amount}
+"
+                    f"👤 Sender: {sender or 'Unknown'}"
+                )
+            else:
+                msg = f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!
+Ref: {ref}"
+            await _bot_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=msg)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(notify())
+        loop.close()
+
+def run_flask():
     port = int(os.getenv("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), KeepAlive).serve_forever()
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
 
 # ==================== MAIN ====================
 
 def main():
-    thread = threading.Thread(target=run_server)
-    thread.daemon = True
-    thread.start()
+    global _bot_app
+    init_db()  # ← PostgreSQL tables ይፈጥራል
+
+    # Flask SMS webhook — background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
 
     import asyncio
     import telegram as tg
@@ -958,8 +1164,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    _bot_app = app  # SMS webhook notification ለማስቻል
+
     print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded")
     print("✅ Bot እየሰራ ነው...")
+    print(f"✅ SMS Webhook: /sms endpoint ready")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
