@@ -321,7 +321,7 @@ Admin አዲስ መልእክት: "{new_message}"
 
 ህጎች:
 1. Admin ያስተማረህን ደጋግመህ አረጋግጥ — ካልገባህ ጠይቅ
-2. Admin "ጨረስኩ"/"እሺ ጨረስኩ"/"አልቋል"/"በቃ" ካለ → ሁሉንም ህጎች ጠቅልለህ ስጥ
+2. Admin "ጨረስኩ"/"እሺ ጨረስኩ"/"አልቋል"/"በቃ"/"ጨርሻለሁ"/"ጨርሻለው"/"done" ካለ → ሁሉንም ህጎች ጠቅልለህ ስጥ
 3. ምልስ አጭር ነው — አማርኛ ብቻ
 
 JSON ብቻ ስጥ:
@@ -579,6 +579,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ==================== TEACHING MODE ====================
     if user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
         session = admin_teach_sessions[user_id]
+
+        # ቀጥታ done detection
+        done_keywords = ["ጨረስኩ", "ጨርሻለሁ", "ጨርሻለው", "አልቋል", "በቃ", "done", "finish", "እሺ ጨረስኩ"]
+        if any(kw in raw_text for kw in done_keywords):
+            session["history"].append({"role": "user", "content": raw_text})
+            result = ai_teach_brain(session["history"], raw_text)
+            new_rules = result.get("rules", [])
+            for rule in new_rules:
+                save_admin_rule(rule)
+            admin_teach_sessions[user_id]["active"] = False
+            reply = result.get("reply", "✅ ሁሉንም ተማርኩ!")
+            print(f"📚 Teaching done. {len(new_rules)} rules saved to Neon DB.")
+            await update.message.reply_text(reply)
+            return
+
         session["history"].append({"role": "user", "content": raw_text})
 
         result = ai_teach_brain(session["history"], raw_text)
