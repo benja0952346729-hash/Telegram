@@ -153,7 +153,7 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) ->
         try:
             client = genai.Client(api_key=key)
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.0-flash-lite",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     max_output_tokens=max_tokens,
