@@ -130,7 +130,7 @@ def build_full_state_for_ai(data: dict) -> str:
         if t is None:
             lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ነፃ")
         elif t == "full":
-            paid = "ከፍሏል ✅" if slot["p1_paid"] else "ገና ✅ አልከፈለም ⏳"
+            paid = "ከፍሏል ✅" if slot["p1_paid"] else "ገና አልከፈለም ⏳"
             lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ሙሉ | {slot['p1_name']} (ID:{slot['p1_id']}) | {paid}")
         elif t == "half":
             p1_paid = "✅" if slot["p1_paid"] else "⏳"
@@ -144,7 +144,7 @@ def build_full_state_for_ai(data: dict) -> str:
     summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
     return summary + "\n".join(lines)
 
-# ==================== GEMINI AI CALL (አዲሱ SDK) ====================
+# ==================== GEMINI AI CALL ====================
 
 def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
     for attempt in range(2):
@@ -167,69 +167,73 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) ->
             if "API_KEY_INVALID" in err or "API key not valid" in err:
                 reason = "❌ API Key ትክክል አይደለም"
             elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                reason = "❌ Quota ተጠቀሰ — key limit ደረሰ"
+                reason = "❌ Quota ተጠቀሰ"
             elif "PERMISSION_DENIED" in err:
-                reason = "❌ Permission የለም — key ተሰናክሏል"
+                reason = "❌ Permission የለም"
             elif "UNAVAILABLE" in err or "503" in err:
-                reason = "❌ Gemini server አይሰራም — ቆይቶ ሞክር"
+                reason = "❌ Gemini server አይሰራም"
             elif "timeout" in err.lower():
-                reason = "❌ Timeout — Gemini ዘግይቷል"
+                reason = "❌ Timeout"
             else:
-                reason = f"❌ ያልታወቀ error: {err}"
+                reason = f"❌ Error: {err}"
             print(f"⚠️ Gemini attempt {attempt+1} (key: {key_preview}): {reason}")
-    print("🔴 Gemini ሙሉ በሙሉ አልሰራም — ሁሉም attempts ከሸፉ")
+    print("🔴 Gemini ሙሉ በሙሉ አልሰራም")
     return ""
 
 # ==================== AI BRAIN ====================
 
 def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str) -> dict:
-    prompt = f"""አንተ የሎተሪ ስርዓት ሙሉ admin brain ነህ። ሁሉንም ውሳኔ አንተ ትሰጣለህ።
-Bot worker ብቻ ነው — አንተ የሰጠህውን action ያስፈጽማል።
+    prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። Bot worker ነው የሚያስፈጽመው።
 
 ========= የሎተሪ ህጎች =========
-- ሎተሪ ለ 20 ሰው ብቻ (slots 1-20)
-- እያንዳንዱ slot 5 ቁጥሮች አሉት (1-5, 6-10, ... 96-100)
-- ሙሉ = 400 ብር (አንድ ሰው slot ሙሉ ይይዛል)
-- ግማሽ = 200 ብር (ሁለት ሰዎች አንድ slot ይካፈላሉ)
+- 20 slots (1-20), እያንዳንዱ slot 5 ቁጥሮች (slot1=1-5, slot2=6-10, ... slot20=96-100)
+- ሙሉ = 400ብር (አንድ ሰው), ግማሽ = 200ብር (ሁለት ሰዎች)
 - ሽልማት: 1ኛ=5000ብር, 2ኛ=1000ብር, 3ኛ=400ብር
 - ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ 0952346729
 
-========= slot ለይዝ ምልክቶች =========
-ሙሉ: "76" → slot ያዘ (ቁጥር 76 ያለበት slot)
-ግማሽ: "76+" ወይም "76 ግማሽ" ወይም "76 200" → ግማሽ slot ፍለጋ
+========= ቁጥር መያዝ ምልክቶች =========
+ሙሉ (default): "06", "36ሙሉ", "36 full"
+ግማሽ: "21+", "21ግማሽ", "21half", "21 200"
+ብዙ ቁጥር: "10 16 21ግማሽ" → 10=ሙሉ, 16=ሙሉ, 21=ግማሽ
 
-========= የአሁን ሎተሪ ሁኔታ (ሙሉ) =========
+========= የአሁን ሎተሪ ሁኔታ =========
 {full_state}
 
-========= ተጠቃሚ መረጃ =========
+========= ተጠቃሚ =========
 User ID: {user_id}
 User Name: {user_name}
 መልእክት: "{user_message}"
 
-========= ውሳኔ አሰጣጥ ህጎች =========
-1. ሰው ቁጥር ከፃፈ → slot ፈልግ (ቁጥሩ የትኛው slot ውስጥ ነው?)
-2. Slot ነፃ ከሆነ → book
-3. Slot ሙሉ/ተይዞ ከሆነ → ሌላ ነፃ slot ምረጥ ወይም ለ user ንገረው
-4. ሰው ቀድሞ ያዘ → "ቀድሞ ይዘሃል" ንገረው
-5. ክፍያ ያልተረጋገጠ slot ክፍት አይደለም
-6. Admin ብቻ mark_paid ሊጠቀም ይችላል
-7. ግማሽ + "half/ግማሽ/+/200" ምልክት ካለ → book_half_p1 ወይም book_half_p2
-8. reply በ አማርኛ ብቻ፣ አጭር፣ emoji ጋር
+========= ACTION ህጎች =========
+1. ቁጥር ሲጽፍ → ቀጥታ book (ጥያቄ አትጠይቅ ግልጽ ከሆነ)
+   - reply: "እሺ ገቢ 🙏" ብቻ
+2. ውስብስብ/ግልጽ ካልሆነ → ጥያቄ ጠይቅ
+3. የተያዘ slot ሌላ ሰው ሲጠራ → reply: "ተቀድመሃል ቤተሰብ 🙏"
+4. ሰው ቀድሞ የያዘውን እንደገና ሲጠራ → reply: "ይዥሄልሃለው ቤተሰብ 🙏"
+5. ሰው "ያዝኩ" ቢል ግን ያልያዘ → data ከ show → "አይደለም፣ [ስም] [slot] ይዞታል — ከላይ ተመልከት"
+6. ቁጥር አውጣ → action: cancel
+7. ቁጥር ቀይር (X በ Y) → action: cancel X + book Y
+8. ክፍያ ማስረጃ/screenshot → reply: "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
+9. ሎተሪ ጥያቄ (ሽልማት፣ ቁጥር፣ ወዘተ) → AI ይመልሳል
+10. Admin ብቻ mark_paid ይጠቀማል
 
 ========= OUTPUT FORMAT =========
-JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ። markdown backticks አታስቀምጥ።
+JSON ብቻ። markdown አታስቀምጥ።
 
-ምሳሌዎች:
-{{"action":"book_full","number":76,"name":"አበበ","reply":"✅ 76# ተይዟል! 400 ብር ክፈል 🙏"}}
-{{"action":"book_half_p1","number":76,"name":"አበበ","reply":"✅ 76# ግማሽ ተይዟል (200ብር) 🤝"}}
-{{"action":"book_half_p2","number":76,"name":"አበበ","reply":"✅ ቀላቀለ! Slot ሙሉ ሆኗል 🎉"}}
-{{"action":"cancel","number":76,"reply":"✅ 76# ተሰርዟል።"}}
-{{"action":"mark_paid","number":76,"which":1,"reply":"✅ ክፍያ ተረጋግጧል!"}}
-{{"action":"reply","reply":"❓ ምን ልርዳህ?"}}
+actions ምሳሌ:
+{{"action":"book_full","number":6,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p1","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p2","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":16,"type":"full"}},{{"number":21,"type":"half"}}],"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"cancel","number":6,"reply":"✅ ተሰርዟል።"}}
+{{"action":"cancel_and_rebook","cancel_number":6,"book_number":11,"book_type":"full","name":"አበበ","reply":"✅ ተቀይሯል።"}}
+{{"action":"mark_paid","number":6,"which":1,"reply":"✅ ክፍያ ተረጋግጧል!"}}
+{{"action":"reply","reply":"..."}}
+{{"action":"ask","reply":"የትኛውን በሙሉ ነው? 10 እና 16 ሁሉም ሙሉ ነው?"}}
 
-አሁን JSON ብቻ ስጥ:"""
+አሁን JSON ብቻ:"""
 
-    raw = gemini_call(prompt, max_tokens=300, temperature=0.1)
+    raw = gemini_call(prompt, max_tokens=400, temperature=0.1)
     print(f"🧠 AI Brain raw: {raw}")
 
     try:
@@ -243,7 +247,7 @@ JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ። markdown bac
     return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"}
 
 
-# ==================== BOT EXECUTOR (Worker) ====================
+# ==================== BOT EXECUTOR ====================
 
 def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
     action = action_data.get("action", "reply")
@@ -253,29 +257,55 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
     which  = action_data.get("which", 1)
     changed = False
 
-    if action in ("book_full", "book_half_p1", "book_half_p2") and number:
+    if action == "book_full" and number:
         slot_id, slot = get_slot_by_number(number, data)
-        if slot_id:
-            if action == "book_full" and slot["type"] is None:
-                data["slots"][slot_id].update({
-                    "type": "full",
-                    "p1_id": user_id, "p1_name": name, "p1_paid": False,
-                    "p2_id": None, "p2_name": None, "p2_paid": False,
-                })
-                changed = True
+        if slot_id and slot["type"] is None:
+            data["slots"][slot_id].update({
+                "type": "full",
+                "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                "p2_id": None, "p2_name": None, "p2_paid": False,
+            })
+            changed = True
 
-            elif action == "book_half_p1" and slot["type"] is None:
-                data["slots"][slot_id].update({
-                    "type": "half",
-                    "p1_id": user_id, "p1_name": name, "p1_paid": False,
-                    "p2_id": None, "p2_name": None, "p2_paid": False,
-                })
-                changed = True
+    elif action == "book_half_p1" and number:
+        slot_id, slot = get_slot_by_number(number, data)
+        if slot_id and slot["type"] is None:
+            data["slots"][slot_id].update({
+                "type": "half",
+                "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                "p2_id": None, "p2_name": None, "p2_paid": False,
+            })
+            changed = True
 
-            elif action == "book_half_p2" and slot["type"] == "half" and slot["p2_id"] is None:
-                data["slots"][slot_id].update({
-                    "p2_id": user_id, "p2_name": name, "p2_paid": False,
-                })
+    elif action == "book_half_p2" and number:
+        slot_id, slot = get_slot_by_number(number, data)
+        if slot_id and slot["type"] == "half" and slot["p2_id"] is None:
+            data["slots"][slot_id].update({
+                "p2_id": user_id, "p2_name": name, "p2_paid": False,
+            })
+            changed = True
+
+    elif action == "book_multiple":
+        bookings = action_data.get("bookings", [])
+        for b in bookings:
+            num = b.get("number")
+            btype = b.get("type", "full")
+            if not num:
+                continue
+            slot_id, slot = get_slot_by_number(num, data)
+            if slot_id and slot["type"] is None:
+                if btype == "half":
+                    data["slots"][slot_id].update({
+                        "type": "half",
+                        "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
+                else:
+                    data["slots"][slot_id].update({
+                        "type": "full",
+                        "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
                 changed = True
 
     elif action == "cancel" and number:
@@ -297,6 +327,46 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
                 data["slots"][slot_id].update({
                     "p2_id": None, "p2_name": None, "p2_paid": False
                 })
+                changed = True
+
+    elif action == "cancel_and_rebook":
+        cancel_num = action_data.get("cancel_number")
+        book_num   = action_data.get("book_number")
+        book_type  = action_data.get("book_type", "full")
+        if cancel_num:
+            slot_id, slot = get_slot_by_number(cancel_num, data)
+            if slot_id and (slot["p1_id"] == user_id or slot["p2_id"] == user_id):
+                if slot["p1_id"] == user_id:
+                    if slot["type"] == "half" and slot["p2_id"] is not None:
+                        data["slots"][slot_id].update({
+                            "p1_id": slot["p2_id"], "p1_name": slot["p2_name"],
+                            "p1_paid": slot["p2_paid"],
+                            "p2_id": None, "p2_name": None, "p2_paid": False,
+                        })
+                    else:
+                        nums = slot["numbers"]
+                        data["slots"][slot_id] = make_empty_slot(int(slot_id))
+                        data["slots"][slot_id]["numbers"] = nums
+                else:
+                    data["slots"][slot_id].update({
+                        "p2_id": None, "p2_name": None, "p2_paid": False
+                    })
+                changed = True
+        if book_num:
+            slot_id2, slot2 = get_slot_by_number(book_num, data)
+            if slot_id2 and slot2["type"] is None:
+                if book_type == "half":
+                    data["slots"][slot_id2].update({
+                        "type": "half",
+                        "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
+                else:
+                    data["slots"][slot_id2].update({
+                        "type": "full",
+                        "p1_id": user_id, "p1_name": name, "p1_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
                 changed = True
 
     elif action == "mark_paid" and number:
@@ -328,11 +398,6 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /paid 76    → p1
-    /paid 76 2  → p2
-    Admin ብቻ
-    """
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
 
@@ -364,7 +429,7 @@ async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = slot["p2_name"] if which == 2 else slot["p1_name"]
         await update.message.reply_text(f"✅ {name} ክፍያ ተረጋግጧል!")
     else:
-        await update.message.reply_text("❌ Slot አልተገኘም ወይም ተሳስቷል")
+        await update.message.reply_text("❌ Slot አልተገኘም")
 
 
 async def update_lottery_message(bot: Bot, data: dict):
@@ -383,17 +448,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    raw_text   = update.message.text.strip()
-    user_id    = update.effective_user.id
-    user_name  = update.effective_user.first_name or "ተጠቃሚ"
-    data       = load_data()
+    raw_text  = update.message.text.strip()
+    user_id   = update.effective_user.id
+    user_name = update.effective_user.first_name or "ተጠቃሚ"
+    data      = load_data()
 
     full_state = build_full_state_for_ai(data)
-
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
 
     action_data = ai_brain(raw_text, user_id, user_name, full_state)
     print(f"🧠 Action: {action_data}")
+
+    # ask action → ምላሽ ብቻ (bot state አትቀይር)
+    if action_data.get("action") == "ask":
+        await update.message.reply_text(action_data.get("reply", "❓"))
+        return
 
     result = execute_action(action_data, user_id, data)
 
@@ -426,7 +495,7 @@ def run_server():
 
 def main():
     if not GEMINI_KEYS:
-        print("❌ ምንም Gemini API key አልተገኘም! .env ፋይሉን ፈትሽ።")
+        print("❌ ምንም Gemini API key አልተገኘም!")
         return
 
     thread = threading.Thread(target=run_server)
@@ -458,7 +527,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print(f"✅ {len(GEMINI_KEYS)} Gemini API keys loaded")
-    print("✅ Bot እየሰራ ነው... (Gemini AI Brain Mode)")
+    print("✅ Bot እየሰራ ነው...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
