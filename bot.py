@@ -456,8 +456,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     })
                     booked_full.append(number)
                     changed = True
+                elif slot["type"] == "half" and slot["p2_id"] is None and slot["p1_id"] != user_id:
+                    # ግማሽ ክፍት እያለ ሙሉ ቢፅፍ → ግማሽ ያደርብለታል
+                    data["slots"][slot_id].update({
+                        "p2_id": user_id, "p2_name": display_name, "p2_paid": False
+                    })
+                    half_joined.append(number)
+                    changed = True
                 elif slot["p1_id"] == user_id or slot["p2_id"] == user_id:
-                    await update.message.reply_text(f"⚠️ {number}# ቀድሞ ይዘሃል!")
+                    await update.message.reply_text(f"🙏 {number}# ቀድሞ ይዘሃል!")
                 else:
                     already_taken.append(number)
 
@@ -506,17 +513,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ እነዚህ ቁጥሮች የእርስዎ አይደሉም: {not_yours}")
 
     if already_taken:
-        data = load_data()
-        free_slots = [s for s in data["slots"].values() if s["type"] is None]
-        half_open  = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
-        free_nums  = [s["numbers"][0] for s in free_slots[:5]]
-        half_nums  = [s["numbers"][0] for s in half_open[:3]]
-        msg = f"⚠️ {already_taken} ቀድሞ ተይዟል።\n"
-        if free_nums:
-            msg += f"🟢 ነፃ: {free_nums}\n"
-        if half_nums:
-            msg += f"🟡 ግማሽ ክፍት: {half_nums}"
-        await update.message.reply_text(msg)
+        await update.message.reply_text("🙏 ተቀደምክ! 🙏")
 
     data = load_data()
     if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
