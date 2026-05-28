@@ -145,9 +145,7 @@ def addis_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> 
 
 
 def extract_numbers_from_text(text: str) -> list:
-    """ቁጥሮችን ያወጣል — [(number, is_half), ...]"""
-    # ቁጥር ቀጥሎ + ካለ → ግማሽ፣ የሌለው → ሙሉ
-    matches = re.finditer(r'(\d+)(\+?)', text)
+    matches = re.finditer(r'(?<!\d)(\d{1,3})(\+?)(?!\d)', text)
     seen = set()
     result = []
     for m in matches:
@@ -157,26 +155,6 @@ def extract_numbers_from_text(text: str) -> list:
             seen.add(num)
             result.append((num, is_half))
     return result
-
-
-def translate_to_amharic(text: str) -> str:
-    has_amharic = any('\u1200' <= c <= '\u137F' for c in text)
-    if has_amharic:
-        return text
-
-    prompt = f"""ይህ አማርኛ በ Latin ፊደል የተጻፈ ሊሆን ይችላል (Ethiopic transliteration)።
-ወደ አማርኛ ፊደል ቀይረህ ስጠኝ። ትርጉም አያስፈልግም — ፊደሉን ብቻ ቀይር።
-English ቃላት እና ቁጥሮች እንዳሉ ተው።
-
-መልእክት: "{text}"
-
-አማርኛ ፊደል ብቻ ስጥ። ምንም ማብራሪያ አታክል።"""
-
-    result = addis_call(prompt, max_tokens=150, temperature=0.1)
-    if result:
-        print(f"🔄 Translated: '{text}' → '{result}'")
-        return result
-    return text
 
 
 def detect_half_booking(raw_text: str) -> bool:
@@ -189,27 +167,79 @@ def detect_half_booking(raw_text: str) -> bool:
     return False
 
 def has_text(raw_text: str) -> bool:
-    """ቁጥርና separator ካልሆነ ሌላ ፅሁፍ አለ?"""
-    # ቁጥሮችና separators ሁሉ አስወግድ
-    cleaned = re.sub(r'[\d\s\+\&\,፣#\.\/\*\-]+', '', raw_text).strip()
+    cleaned = re.sub(r'[\d\s\+\&\,፣#\.\/\*\-]|ብር|birr', '', raw_text, flags=re.IGNORECASE).strip()
     return len(cleaned) > 0
+
+
+def build_context_info(data: dict) -> str:
+    filled = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
+    free_slots  = [s for s in data["slots"].values() if s["type"] is None]
+    half_open   = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
+
+    lines = [
+        f"አጠቃላይ: {filled}/20 slots ሞልቷል",
+        f"ነፃ slots: {len(free_slots)} | ግማሽ ክፍት: {len(half_open)}",
+        "",
+        "=== እያንዳንዱ slot ሁኔታ ===",
+    ]
+
+    for slot_id, slot in data["slots"].items():
+        nums = f"{slot['numbers'][0]}-{slot['numbers'][-1]}"
+        if slot["type"] is None:
+            lines.append(f"slot{slot_id} [{nums}]: ነፃ ✅")
+        elif slot["type"] == "full":
+            paid = "✅ ከፍሏል" if slot["p1_paid"] else "⏳ ያልከፈለ"
+            lines.append(f"slot{slot_id} [{nums}]: ሙሉ — {slot['p1_name']} ({paid})")
+        elif slot["type"] == "half":
+            p1 = f"{slot['p1_name']} ({'✅' if slot['p1_paid'] else '⏳'})"
+            if slot["p2_id"] is None:
+                lines.append(f"slot{slot_id} [{nums}]: ግማሽ — {p1} | ሁለተኛ ሰው ክፍት 🟡")
+            else:
+                p2 = f"{slot['p2_name']} ({'✅' if slot['p2_paid'] else '⏳'})"
+                lines.append(f"slot{slot_id} [{nums}]: ግማሽ ሙሉ — {p1} + {p2}")
+
+    if filled < 20:
+        lines.append("\n⚠️ ሎተሪ ገና አልሞላም — ነፃ slots አሉ!")
+    else:
+        lines.append("\n✅ ሁሉም slots ተሞልቷል!")
+
+    return "\n".join(lines)
 
 
 def ai_brain(raw_text: str, sender_first_name: str, context_info: str) -> dict:
     """
-    AI Brain — ሁሉንም ይወስናል። JSON ብቻ ይመልሳል።
-    Bot ያንን JSON ብቻ ያነባል።
+    AI Brain — ቁጥር book/cancel ብቻ valid=true።
+    ሌላ ሁሉም (ጥያቄ፣ ሰላምታ፣ check፣ ወዘተ) → valid=false + reply።
     """
     prompt = f"""አንተ የሎተሪ bot brain ነህ። JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 
-=== ሎተሪ ህግ ===
-- 20 slots አሉ። እያንዳንዱ slot 5 ቁጥሮች አሉት።
-- slot 1=1-5, slot 2=6-10, slot 3=11-15 ... slot 19=91-95, slot 20=96-100
-- ቁጥር ብቻ ሲልኩ → book intent
-- ቁጥር+ ሲልኩ (ለምሳሌ 10+) → half book
-- ብዙ ቁጥሮች (10&16, 7 8+) → ሁሉንም actions array ውስጥ ጨምር
-- cancel/ሰርዝ/ልቀቅ → cancel intent
-- ሌላ ማንኛውም ጥያቄ → valid=false, reply ስጥ
+=== ህግ — ጥብቅ ===
+valid=true የሚሆነው ሰው ቁጥር ሊይዝ ወይም ሊሰርዝ ሲፈልግ ብቻ ነው።
+ሌላ ሁሉም → valid=false + reply (አማርኛ፣ አጭር፣ ትክክለኛ መልስ)።
+
+=== valid=true ምሳሌዎች ===
+- "21" → {{"intent":"book","number":21,"is_half":false,"name":null}}
+- "21+" → {{"intent":"book","number":21,"is_half":true,"name":null}}
+- "21 ግማሽ" / "21 half" → is_half=true
+- "10 እና 16" → ሁለት actions
+- "7 8 9" → ሶስት actions
+- "cancel 21" / "ሰርዝ 10" / "ልቀቅ 5" → intent=cancel
+- "21 አበበ ብለህ ያዝልኝ" → number=21, name="አበበ"
+- "16 ለእናቴ ያዝልኝ ስሟ ሳራ ነው" → number=16, name="ሳራ"
+- "10 ለጓደኛዬ ለዮሐንስ" → number=10, name="ዮሐንስ"
+- "21+ አበበ" → number=21, is_half=true, name="አበበ"
+- "ያዝልኝ 33" → number=33, name=null (sender name ይጠቀማል)
+
+name rule: መልእክቱ ውስጥ ሌላ ሰው ስም ካለ → name ስጥ። ከሌለ → name=null።
+
+=== valid=false ምሳሌዎች ===
+- "51 አለ ወይ?" → slot ሁኔታ ንገረው (ነፃ ወይም ተይዟል)
+- "ስንት ቀርቷል?" → ቀሪ slots ብዛት ንገረው
+- "ዋጋው ስንት ነው?" → 400ብር ሙሉ፣ 200ብር ግማሽ ንገረው
+- "መቼ ነው ዕጣው?" → አታውቅም ብል
+- "ሰላም" / "ሃሎ" → ሰላምታ ልስጥ
+- "ሽልማቱ ስንት ነው?" → 1ኛ=5000፣ 2ኛ=1000፣ 3ኛ=400 ንገረው
+- ቁጥር ያለው ግን booking/cancel አይደለም → valid=false
 
 === አሁናዊ ሁኔታ ===
 {context_info}
@@ -218,17 +248,16 @@ def ai_brain(raw_text: str, sender_first_name: str, context_info: str) -> dict:
 ስም: {sender_first_name}
 መልእክት: "{raw_text}"
 
-=== JSON format (ብቻ) ===
+=== JSON format ===
 {{
   "actions": [
-    {{"intent": "book", "number": 10, "is_half": false, "name": null}},
-    {{"intent": "book", "number": 7,  "is_half": true,  "name": null}}
+    {{"intent": "book", "number": 21, "is_half": false, "name": null}}
   ],
   "valid": true,
   "reply": null
 }}
 
-valid=false ከሆነ reply አማርኛ ስጥ። valid=true ከሆነ reply=null ይሁን።
+valid=false ከሆነ reply=አማርኛ መልስ፣ valid=true ከሆነ reply=null።
 JSON ብቻ። ምንም ማብራሪያ አታክል።"""
 
     result = addis_call(prompt, max_tokens=300, temperature=0.1)
@@ -247,61 +276,12 @@ JSON ብቻ። ምንም ማብራሪያ አታክል።"""
     is_half = detect_half_booking(raw_text)
     if nums:
         return {
-            "actions": [{"intent": "book", "number": n, "is_half": is_half, "name": None} for n in nums],
+            "actions": [{"intent": "book", "number": n, "is_half": is_half, "name": None} for n, h in nums],
             "valid": True,
             "reply": None
         }
     return {"actions": [], "valid": False, "reply": "❓ ልረዳህ አልቻልኩም። ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
 
-
-def build_context_info(data: dict) -> str:
-    """
-    Addis AI ሎተሪው ያለበትን ሁኔታ በዝርዝር ያሳውቃል።
-    ይህ context Addis AI "ሁሉም ሞልቷል" ብሎ እንዳይሳሳት ይከላከላል።
-    """
-    filled = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
-    free_slots = [s for s in data["slots"].values() if s["type"] is None]
-    half_open  = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
-
-    free_nums = [s["numbers"][0] for s in free_slots[:5]]
-    half_nums = [s["numbers"][0] for s in half_open[:3]]
-
-    lines = [
-        f"ሞልቷል: {filled}/20 slots",
-        f"ነፃ slots (ሙሉ ሊያዙ የሚችሉ): {len(free_slots)} ቀርቷል → ናሙና ቁጥሮች: {free_nums if free_nums else 'የሉም'}",
-        f"ግማሽ ክፍት slots (ሌላ ሰው ሊቀላቀል): {len(half_open)} → ናሙና ቁጥሮች: {half_nums if half_nums else 'የሉም'}",
-    ]
-    if filled < 20:
-        lines.append("⚠️ ሎተሪ ገና አልሞላም — ነፃ slots አሉ!")
-    else:
-        lines.append("✅ ሁሉም slots ተሞልቷል!")
-    return "\n".join(lines)
-
-
-def ask_addis_ai(amharic_message: str, context_info: str) -> str:
-    prompt = f"""አንተ የሎተሪ bot ነህ። አማርኛ ብቻ ተናገር። አጭር እና ግልጽ መልስ ስጥ። emoji ተጠቀም። markdown formatting አትጠቀም።
-
-=== ጨዋታው እንዴት እንደሚሰራ ===
-- ሎተሪ ለ 20 ሰው ብቻ ነው (20 slots)
-- እያንዳንዱ slot 5 ቁጥሮች አሉት (slot 1=1-5, slot 2=6-10, ... slot 19=91-95, slot 20=96-100)
-- ቁጥር ለመያዝ → ከዚያ slot ውስጥ ማንኛውንም ቁጥር ፃፍ (ለምሳሌ 91 ወይም 95)
-- ዋጋ: 400 ብር (ሙሉ slot) ወይም 200 ብር (ግማሽ slot — 2 ሰው ይካፈላሉ)
-- ሽልማት: 1ኛ=5000ብር 🥇  2ኛ=1000ብር 🥈  3ኛ=400ብር 🥉
-- ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ ብር 0952346729
-
-=== አስፈላጊ ህጎች — ፈጽሞ አትጣስ ===
-1. context ውስጥ "ነፃ slots አሉ" ካለ → "ሁሉም ሞልቷል" ብለህ አትናገር
-2. ቁጥር ተልኮ slot ክፍት ከሆነ → "እሺ ገቢ 400ብር 🙏" ብል
-3. ቁጥር ተልኮ slot ተይዟል → "⚠️ ቁጥሩ ተይዟል። ሌላ ምረጥ: [ነፃ ቁጥሮች]" ብል
-4. context ሳታምን ምንም አትናገር
-
-=== አሁናዊ የሎተሪ ሁኔታ ===
-{context_info}
-
-ተጠቃሚ መልእክት: {amharic_message}"""
-
-    result = addis_call(prompt, max_tokens=300, temperature=0.5)
-    return result if result else "❌ AI አገልግሎት ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"
 
 # ==================== BOT HANDLERS ====================
 
@@ -380,7 +360,6 @@ async def update_lottery_message(bot: Bot, data: dict):
             print("✅ Lottery message updated successfully")
         except Exception as e:
             print(f"❌ Message update error: {e}")
-            # ✅ FIX: edit fail ከሆነ አዲስ message ልካ
             try:
                 sent = await bot.send_message(chat_id=chat_id, text=build_full_message(data))
                 data["lottery_message_id"] = sent.message_id
@@ -402,11 +381,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
     context_info = build_context_info(data)
 
-    # ፅሁፍ አለ? → AI brain፣ ፅሁፍ የለም? → bot ቀጥታ
     number_list = extract_numbers_from_text(raw_text)
 
     if has_text(raw_text):
-        # AI Brain
+        # AI Brain — ቁጥር book/cancel ብቻ valid=true፣ ሌላ ሁሉም false
         brain = ai_brain(raw_text, sender_first_name, context_info)
         valid  = brain.get("valid", False)
         reply  = brain.get("reply", None)
@@ -465,6 +443,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     })
                     half_joined.append(number)
                     changed = True
+                elif slot["type"] == "half" and slot["p1_id"] == user_id:
+                    await update.message.reply_text(f"⚠️ {number}# ቀድሞ ይዘሃል!")
                 else:
                     already_taken.append(number)
             else:
@@ -493,8 +473,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "p2_id": None, "p2_name": None, "p2_paid": False,
                     })
                 else:
+                    saved_numbers = slot["numbers"]
                     data["slots"][slot_id] = make_empty_slot(int(slot_id))
-                    data["slots"][slot_id]["numbers"] = slot["numbers"]
+                    data["slots"][slot_id]["numbers"] = saved_numbers
                 cancelled.append(number)
                 changed = True
             elif slot["type"] == "half" and slot["p2_id"] == user_id:
@@ -525,6 +506,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ እነዚህ ቁጥሮች የእርስዎ አይደሉም: {not_yours}")
 
     if already_taken:
+        data = load_data()
         free_slots = [s for s in data["slots"].values() if s["type"] is None]
         half_open  = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
         free_nums  = [s["numbers"][0] for s in free_slots[:5]]
