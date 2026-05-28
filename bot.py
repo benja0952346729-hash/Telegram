@@ -6,31 +6,33 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+import google.generativeai as genai
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 DATA_FILE = "lottery_data.json"
 
-ADDIS_AI_KEYS = [
-    os.getenv("ADDIS_AI_API_KEY_1"),
-    os.getenv("ADDIS_AI_API_KEY_2"),
-    os.getenv("ADDIS_AI_API_KEY_3"),
-    os.getenv("ADDIS_AI_API_KEY_4"),
-    os.getenv("ADDIS_AI_API_KEY_5"),
-    os.getenv("ADDIS_AI_API_KEY_6"),
-    os.getenv("ADDIS_AI_API_KEY_7"),
-    os.getenv("ADDIS_AI_API_KEY_8"),
-    os.getenv("ADDIS_AI_API_KEY_9"),
-    os.getenv("ADDIS_AI_API_KEY_10"),
+# ==================== GEMINI MULTI-KEY ROTATION ====================
+GEMINI_KEYS = [
+    os.getenv("GEMINI_API_KEY_1"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+    os.getenv("GEMINI_API_KEY_4"),
+    os.getenv("GEMINI_API_KEY_5"),
+    os.getenv("GEMINI_API_KEY_6"),
+    os.getenv("GEMINI_API_KEY_7"),
+    os.getenv("GEMINI_API_KEY_8"),
+    os.getenv("GEMINI_API_KEY_9"),
+    os.getenv("GEMINI_API_KEY_10"),
 ]
-ADDIS_AI_KEYS = [k for k in ADDIS_AI_KEYS if k]
-current_key_index = 0
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+gemini_key_index = 0
 
-def get_next_key() -> str:
-    global current_key_index
-    key = ADDIS_AI_KEYS[current_key_index % len(ADDIS_AI_KEYS)]
-    current_key_index += 1
+def get_next_gemini_key() -> str:
+    global gemini_key_index
+    key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
+    gemini_key_index += 1
     return key
 
 # ==================== LOTTERY TEMPLATE ====================
@@ -120,10 +122,6 @@ def build_full_message(data: dict) -> str:
     return LOTTERY_TEMPLATE.format(numbers=build_numbers_text(data))
 
 def build_full_state_for_ai(data: dict) -> str:
-    """
-    AI brain ሁሉንም ሎተሪ ሁኔታ ያነባ ዘንድ
-    ሙሉ state ወደ readable text ይቀይራል
-    """
     lines = []
     for slot_id, slot in data["slots"].items():
         nums = slot["numbers"]
@@ -145,45 +143,42 @@ def build_full_state_for_ai(data: dict) -> str:
     summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
     return summary + "\n".join(lines)
 
-# ==================== ADDIS AI CALL ====================
+# ==================== GEMINI AI CALL ====================
 
-def addis_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
+def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
     try:
-        response = requests.post(
-            "https://api.addisassistant.com/api/v1/chat_generate",
-            headers={"x-api-key": get_next_key(), "Content-Type": "application/json"},
-            json={
-                "model": "Addis-፩-አሌፍ",
-                "prompt": prompt,
-                "target_language": "am",
-                "generation_config": {"temperature": temperature, "maxOutputTokens": max_tokens}
-            },
-            timeout=25
+        genai.configure(api_key=get_next_gemini_key())
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            generation_config=genai.GenerationConfig(
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+            )
         )
-        data = response.json()
-        inner = data.get("data", data)
-        return inner.get("response_text", "").strip()
+        response = model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
-        print(f"❌ Addis AI error: {e}")
+        print(f"❌ Gemini error (key {gemini_key_index}): {e}")
+        # ሌላ key ሞክር
+        if len(GEMINI_KEYS) > 1:
+            try:
+                genai.configure(api_key=get_next_gemini_key())
+                model = genai.GenerativeModel(
+                    model_name="gemini-1.5-flash",
+                    generation_config=genai.GenerationConfig(
+                        temperature=temperature,
+                        max_output_tokens=max_tokens,
+                    )
+                )
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e2:
+                print(f"❌ Gemini retry error: {e2}")
         return ""
 
 # ==================== AI BRAIN ====================
 
 def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str) -> dict:
-    """
-    Addis AI = Admin Brain
-    ሁሉንም ሎተሪ ሁኔታ ያውቃል።
-    JSON action ይወስናል።
-
-    Actions:
-      book_full    → {"action":"book_full",   "number":<int>, "name":<str>, "reply":<str>}
-      book_half_p1 → {"action":"book_half_p1","number":<int>, "name":<str>, "reply":<str>}
-      book_half_p2 → {"action":"book_half_p2","number":<int>, "name":<str>, "reply":<str>}
-      cancel       → {"action":"cancel",       "number":<int>, "reply":<str>}
-      mark_paid    → {"action":"mark_paid",    "number":<int>, "which":<1|2>, "reply":<str>}
-      reply        → {"action":"reply",        "reply":<str>}
-    """
-
     prompt = f"""አንተ የሎተሪ ስርዓት ሙሉ admin brain ነህ። ሁሉንም ውሳኔ አንተ ትሰጣለህ።
 Bot worker ብቻ ነው — አንተ የሰጠህውን action ያስፈጽማል።
 
@@ -218,7 +213,7 @@ User Name: {user_name}
 8. reply በ አማርኛ ብቻ፣ አጭር፣ emoji ጋር
 
 ========= OUTPUT FORMAT =========
-JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ።
+JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ። markdown backticks አታስቀምጥ።
 
 ምሳሌዎች:
 {{"action":"book_full","number":76,"name":"አበበ","reply":"✅ 76# ተይዟል! 400 ብር ክፈል 🙏"}}
@@ -230,27 +225,24 @@ JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ።
 
 አሁን JSON ብቻ ስጥ:"""
 
-    raw = addis_call(prompt, max_tokens=300, temperature=0.1)
+    raw = gemini_call(prompt, max_tokens=300, temperature=0.1)
     print(f"🧠 AI Brain raw: {raw}")
 
     try:
-        match = re.search(r'\{.*?\}', raw, re.DOTALL)
+        # markdown backticks አስወግድ
+        clean = re.sub(r'```(?:json)?', '', raw).strip()
+        match = re.search(r'\{.*?\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
         print(f"❌ AI Brain parse error: {e}")
 
-    # fallback
     return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"}
 
 
 # ==================== BOT EXECUTOR (Worker) ====================
 
 def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
-    """
-    AI brain የሰጠውን action ያስፈጽማል።
-    ተሻሻለ data እና reply ይመልሳል።
-    """
     action = action_data.get("action", "reply")
     reply  = action_data.get("reply", "")
     number = action_data.get("number")
@@ -288,7 +280,6 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
         if slot_id and slot["type"] is not None:
             if slot["p1_id"] == user_id:
                 if slot["type"] == "half" and slot["p2_id"] is not None:
-                    # p2 → p1 ይሆናል
                     data["slots"][slot_id].update({
                         "p1_id": slot["p2_id"], "p1_name": slot["p2_name"],
                         "p1_paid": slot["p2_paid"],
@@ -394,23 +385,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name  = update.effective_user.first_name or "ተጠቃሚ"
     data       = load_data()
 
-    # ── ሙሉ state ለ AI brain ──
     full_state = build_full_state_for_ai(data)
 
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
 
-    # ── AI Brain ውሳኔ ──
     action_data = ai_brain(raw_text, user_id, user_name, full_state)
     print(f"🧠 Action: {action_data}")
 
-    # ── Bot Worker ያስፈጽማል ──
     result = execute_action(action_data, user_id, data)
 
     if result["changed"]:
         save_data(result["data"])
         await update_lottery_message(context.bot, result["data"])
 
-        # ሁሉም slots ሞልቷቸው?
         filled = sum(1 for s in result["data"]["slots"].values() if is_slot_full_booked(s))
         if filled == 20:
             await update.message.reply_text("🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
@@ -435,6 +422,10 @@ def run_server():
 # ==================== MAIN ====================
 
 def main():
+    if not GEMINI_KEYS:
+        print("❌ ምንም Gemini API key አልተገኘም! .env ፋይሉን ፈትሽ።")
+        return
+
     thread = threading.Thread(target=run_server)
     thread.daemon = True
     thread.start()
@@ -457,8 +448,8 @@ def main():
     app.add_handler(CommandHandler("paid", mark_paid_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded")
-    print("✅ Bot እየሰራ ነው... (AI Brain Mode)")
+    print(f"✅ {len(GEMINI_KEYS)} Gemini API keys loaded")
+    print("✅ Bot እየሰራ ነው... (Gemini AI Brain Mode)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
