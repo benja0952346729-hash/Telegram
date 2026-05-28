@@ -64,9 +64,12 @@ def make_empty_slot(i: int) -> dict:
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
+        if "last_numbers_per_user" not in d:
+            d["last_numbers_per_user"] = {}
+        return d
     slots = {str(i): make_empty_slot(i) for i in range(1, 21)}
-    return {"slots": slots, "lottery_message_id": None, "chat_id": None}
+    return {"slots": slots, "lottery_message_id": None, "chat_id": None, "last_numbers_per_user": {}}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -206,7 +209,8 @@ def build_context_info(data: dict) -> str:
     return "\n".join(lines)
 
 
-def ai_brain(raw_text: str, sender_first_name: str, context_info: str) -> dict:
+def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
+             last_numbers: list = None, free_numbers: list = None) -> dict:
     """
     AI Brain — ቁጥር book/cancel ብቻ valid=true።
     ሌላ ሁሉም (ጥያቄ፣ ሰላምታ፣ check፣ ወዘተ) → valid=false + reply።
@@ -229,6 +233,23 @@ valid=true የሚሆነው ሰው ቁጥር ሊይዝ ወይም ሊሰርዝ ሲ
 - "10 ለጓደኛዬ ለዮሐንስ" → number=10, name="ዮሐንስ"
 - "21+ አበበ" → number=21, is_half=true, name="አበበ"
 - "ያዝልኝ 33" → number=33, name=null (sender name ይጠቀማል)
+
+=== ቀዳሚ ቁጥሮች / last_numbers ===
+ሰው ቁጥር ሳይጠቅስ "ያዝልኝ" / "አዎ" / "እሺ" / "yep" / "yes" ካለ → last_numbers ይጠቀም።
+last_numbers: {last_numbers if last_numbers else "የሉም"}
+
+ምሳሌዎች:
+- last_numbers=[11,31,51] ሳለ "ያዝልኝ" → 11, 31, 51 book
+- last_numbers=[66] ሳለ "በግማሽ ያዝልኝ" → 66 is_half=true book
+- last_numbers=[11,31] ሳለ "አዎ እሺ" → 11, 31 book
+
+=== ሁሉንም ቀሪ ቁጥሮች ===
+ሰው "ቀሪውን ያዝልኝ" / "ሁሉንም ቀሪ" / "remaining" ካለ → free_numbers ሁሉ book።
+free_numbers (ነፃ slots የመጀመሪያ ቁጥሮች): {free_numbers if free_numbers else "የሉም"}
+
+ምሳሌዎች:
+- "ቀሪ ቁጥሮች ያዝልኝ" → free_numbers ሁሉ book
+- "ሁሉንም ቀሪ ያዝ" → free_numbers ሁሉ book
 
 name rule: መልእክቱ ውስጥ ሌላ ሰው ስም ካለ → name ስጥ። ከሌለ → name=null።
 
@@ -383,9 +404,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     number_list = extract_numbers_from_text(raw_text)
 
+    # ቀዳሚ ቁጥሮች — ይህ user ያሳለፋቸው ቁጥሮች
+    user_id_str = str(user_id)
+    last_numbers = data.get("last_numbers_per_user", {}).get(user_id_str, [])
+
+    # ነፃ slots የመጀመሪያ ቁጥሮች
+    free_numbers = [s["numbers"][0] for s in data["slots"].values() if s["type"] is None]
+
+    # ቁጥሮች ካሉ → save as last_numbers
+    if number_list:
+        data.setdefault("last_numbers_per_user", {})[user_id_str] = [n for n, h in number_list]
+        save_data(data)
+
     if has_text(raw_text):
         # AI Brain — ቁጥር book/cancel ብቻ valid=true፣ ሌላ ሁሉም false
-        brain = ai_brain(raw_text, sender_first_name, context_info)
+        brain = ai_brain(raw_text, sender_first_name, context_info, last_numbers, free_numbers)
         valid  = brain.get("valid", False)
         reply  = brain.get("reply", None)
         print(f"🧠 brain={brain}")
