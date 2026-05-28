@@ -582,11 +582,17 @@ GEMINI_MODELS = [
 
 def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
     last_error = None
-    # ሁሉም keys × ሁሉም models እንሞክር
+    print(f"🔑 Gemini keys loaded: {len(GEMINI_KEYS)}")
+    if not GEMINI_KEYS:
+        print("❌ CRITICAL: No Gemini keys found in environment!")
+        return ""
+
     for model in GEMINI_MODELS:
         for attempt in range(len(GEMINI_KEYS)):
             key = get_next_gemini_key()
+            key_preview = key[:8] + "..." if key else "None"
             try:
+                print(f"🚀 Trying {model} key {attempt+1} ({key_preview})")
                 response = requests.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
                     headers={"Content-Type": "application/json"},
@@ -599,27 +605,59 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) ->
                     },
                     timeout=20
                 )
+                print(f"📡 Status: {response.status_code} | Model: {model} | Key: {attempt+1}")
+
                 if response.status_code == 429:
-                    print(f"⚠️ Gemini {model} key {attempt+1} rate limited, trying next...")
+                    print(f"⚠️ 429 Rate limited — {model} key {attempt+1}")
                     last_error = "429"
                     time.sleep(0.3)
                     continue
-                if response.status_code != 200:
-                    print(f"⚠️ Gemini {model} key {attempt+1} error {response.status_code}")
-                    last_error = str(response.status_code)
+
+                if response.status_code == 400:
+                    body = response.text[:300]
+                    print(f"❌ 400 Bad Request — {model} key {attempt+1}: {body}")
+                    last_error = f"400: {body}"
                     continue
+
+                if response.status_code == 403:
+                    body = response.text[:300]
+                    print(f"❌ 403 Forbidden (invalid key?) — {model} key {attempt+1}: {body}")
+                    last_error = f"403: {body}"
+                    continue
+
+                if response.status_code != 200:
+                    body = response.text[:300]
+                    print(f"⚠️ HTTP {response.status_code} — {model} key {attempt+1}: {body}")
+                    last_error = f"{response.status_code}: {body}"
+                    continue
+
                 data = response.json()
+
+                # candidates ባዶ ከሆነ
+                if not data.get("candidates"):
+                    print(f"⚠️ Empty candidates — {model} key {attempt+1}: {data}")
+                    last_error = "empty candidates"
+                    continue
+
                 text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                print(f"✅ Gemini response ({model}, key {attempt+1}): {text[:80]}")
+                print(f"✅ Gemini OK ({model}, key {attempt+1}): {text[:80]}")
                 increment_counter("gemini_calls")
                 return text
+
+            except requests.exceptions.Timeout:
+                print(f"⏱️ Timeout — {model} key {attempt+1}")
+                last_error = "timeout"
+                increment_counter("errors")
+                continue
             except Exception as e:
-                print(f"❌ Gemini call error ({model}, key {attempt+1}): {e}")
+                print(f"❌ Exception — {model} key {attempt+1}: {type(e).__name__}: {e}")
                 last_error = str(e)
                 increment_counter("errors")
                 continue
+
         print(f"⚠️ All keys failed for {model}, trying next model...")
-    print(f"❌ All Gemini models and keys failed: {last_error}")
+
+    print(f"❌ ALL Gemini models and keys failed. Last error: {last_error}")
     return ""
 
 def extract_numbers_from_text(text: str) -> list:
