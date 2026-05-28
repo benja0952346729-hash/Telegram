@@ -6,7 +6,8 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -143,38 +144,26 @@ def build_full_state_for_ai(data: dict) -> str:
     summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
     return summary + "\n".join(lines)
 
-# ==================== GEMINI AI CALL ====================
+# ==================== GEMINI AI CALL (አዲሱ SDK) ====================
 
 def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
-    try:
-        genai.configure(api_key=get_next_gemini_key())
-        model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            generation_config=genai.GenerationConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-            )
-        )
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        print(f"❌ Gemini error (key {gemini_key_index}): {e}")
-        # ሌላ key ሞክር
-        if len(GEMINI_KEYS) > 1:
-            try:
-                genai.configure(api_key=get_next_gemini_key())
-                model = genai.GenerativeModel(
-                    model_name="gemini-1.5-flash",
-                    generation_config=genai.GenerationConfig(
-                        temperature=temperature,
-                        max_output_tokens=max_tokens,
-                    )
+    for attempt in range(2):
+        try:
+            client = genai.Client(api_key=get_next_gemini_key())
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=max_tokens,
+                    temperature=temperature,
                 )
-                response = model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e2:
-                print(f"❌ Gemini retry error: {e2}")
-        return ""
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"❌ Gemini error (attempt {attempt + 1}): {e}")
+            if attempt == 1:
+                return ""
+    return ""
 
 # ==================== AI BRAIN ====================
 
@@ -229,7 +218,6 @@ JSON ብቻ ስጥ። ምንም ሌላ ቃል አታስቀምጥ። markdown bac
     print(f"🧠 AI Brain raw: {raw}")
 
     try:
-        # markdown backticks አስወግድ
         clean = re.sub(r'```(?:json)?', '', raw).strip()
         match = re.search(r'\{.*?\}', clean, re.DOTALL)
         if match:
