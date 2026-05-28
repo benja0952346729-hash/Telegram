@@ -217,61 +217,47 @@ def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
     """
     prompt = f"""አንተ የሎተሪ bot brain ነህ። JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 
-=== ህግ — ጥብቅ ===
-valid=true የሚሆነው ሰው ቁጥር ሊይዝ ወይም ሊሰርዝ ሲፈልግ ብቻ ነው።
-ሌላ ሁሉም → valid=false + reply (አማርኛ፣ አጭር፣ ትክክለኛ መልስ)።
+=== ዋጋ ===
+ሙሉ slot=400ብር | ግማሽ slot=200ብር | ሌላ ዋጋ የለም።
 
-=== valid=true ምሳሌዎች ===
-- "21" → {{"intent":"book","number":21,"is_half":false,"name":null}}
-- "21+" → {{"intent":"book","number":21,"is_half":true,"name":null}}
-- "21 ግማሽ" / "21 half" → is_half=true
-- "10 እና 16" → ሁለት actions
-- "7 8 9" → ሶስት actions
-- "cancel 21" / "ሰርዝ 10" / "ልቀቅ 5" → intent=cancel
-- "21 አበበ ብለህ ያዝልኝ" → number=21, name="አበበ"
-- "16 ለእናቴ ያዝልኝ ስሟ ሳራ ነው" → number=16, name="ሳራ"
-- "10 ለጓደኛዬ ለዮሐንስ" → number=10, name="ዮሐንስ"
-- "21+ አበበ" → number=21, is_half=true, name="አበበ"
-- "ያዝልኝ 33" → number=33, name=null (sender name ይጠቀማል)
+=== Latin አማርኛ ===
+ሰዎች አማርኛን በ Latin ፊደል ይፅፋሉ (Ethiopic transliteration)።
+Latin ቃል ሲመጣ አማርኛ ነው — ሙሉ ፍቺውን ተረድተህ ስራ።
+ያልተዘረዘረ ቃልም ቢሆን context ተጠቅመህ ፍቺውን ተረዳ።
 
-=== ቀዳሚ ቁጥሮች / last_numbers ===
-ሰው ቁጥር ሳይጠቅስ "ያዝልኝ" / "አዎ" / "እሺ" / "yep" / "yes" ካለ → last_numbers ይጠቀም።
-last_numbers: {last_numbers if last_numbers else "የሉም"}
+=== Intents — ሁሉንም ተረዳ ===
+bot ሊያስተናግዳቸው የሚችላቸው intents:
 
-ምሳሌዎች:
-- last_numbers=[11,31,51] ሳለ "ያዝልኝ" → 11, 31, 51 book
-- last_numbers=[66] ሳለ "በግማሽ ያዝልኝ" → 66 is_half=true book
-- last_numbers=[11,31] ሳለ "አዎ እሺ" → 11, 31 book
+1. book — ቁጥር መያዝ
+   - number, is_half (true/false), name (ሌላ ሰው ስም ካለ)
+   - ቁጥር ብቻ ሲላክ → book, is_half=false
+   - ቁጥር+ ወይም "ግማሽ" ሲኖር → is_half=true
+   - ቁጥር ሳይኖር "ያዝልኝ/አዎ/እሺ" → last_numbers ተጠቀም: {last_numbers if last_numbers else "የሉም"}
+   - "ሁሉንም/ቀሪ ያዝልኝ" → free_numbers ሁሉ book: {free_numbers if free_numbers else "የሉም"}
 
-=== ሁሉንም ቀሪ ቁጥሮች ===
-ሰው "ቀሪውን ያዝልኝ" / "ሁሉንም ቀሪ" / "remaining" ካለ → free_numbers ሁሉ book።
-free_numbers (ነፃ slots የመጀመሪያ ቁጥሮች): {free_numbers if free_numbers else "የሉም"}
+2. cancel — ቁጥር መሰረዝ
+   - number
 
-ምሳሌዎች:
-- "ቀሪ ቁጥሮች ያዝልኝ" → free_numbers ሁሉ book
-- "ሁሉንም ቀሪ ያዝ" → free_numbers ሁሉ book
+3. change_type — slot አይነት መቀየር
+   - number, new_type ("full" ወይም "half")
+   - "X ወደ ግማሽ ቀይር" → change_type, new_type="half"
+   - "X ወደ ሙሉ ቀይር" → change_type, new_type="full"
 
-name rule: መልእክቱ ውስጥ ሌላ ሰው ስም ካለ → name ስጥ። ከሌለ → name=null።
+4. swap — ቁጥሮች መቀያየር/መቀናበር
+   - cancel_number (የሚሰረዘው), book_numbers (የሚያዙት list), is_half
+   - "31+ እና 41+ ተካልኝ 41 ይቅር" → cancel 41, book 31+ እና 41+
+   - "X ሰርዘህ Y ያዝልኝ" → swap
 
-=== valid=false ምሳሌዎች ===
-- "51 አለ ወይ?" → slot ሁኔታ ንገረው (ነፃ ወይም ተይዟል)
-- "61 ale wey?" → "61 ale wey?" = "61 አለ ወይ?" → slot ሁኔታ ንገረው
-- "yelem?" / "alegn?" / "new wey?" → ጥያቄ ነው → valid=false, reply ስጥ
-- "ቀሪ ቁጥሮች አሉ" → ጥያቄ/statement ነው → ቀሪ slots ብዛት ንገረው (book አይደለም!)
-- "ስንት ቀርቷል?" / "kemiru sint new?" → ቀሪ slots ብዛት ንገረው
-- "ዋጋው ስንት ነው?" / "wagaw sint?" → 400ብር ሙሉ፣ 200ብር ግማሽ ንገረው
-- "መቼ ነው ዕጣው?" / "meche new?" → አታውቅም ብል
-- "ሰላም" / "selam" / "halo" / "hi" → ሰላምታ ልስጥ
-- "ሽልማቱ ስንት ነው?" / "shilmatu sint?" → 1ኛ=5000፣ 2ኛ=1000፣ 3ኛ=400 ንገረው
-- ቁጥር ያለው ግን booking/cancel አይደለም → valid=false
+=== ጥያቄ vs Action ===
+ሰው action እንደፈለገ ግልጽ ከሆነ → valid=true
+ጥያቄ / information request / statement ከሆነ → valid=false + reply (አማርኛ፣ አጭር)
 
-⚠️ ወሳኝ ህግ — ጥያቄ vs Booking እንዴት ይለያል:
-ቁጥር ብቻ ሲላክ (ምሳሌ: "21", "21+") → booking
-ቁጥር + ማንኛውም verb/ቃል ሲኖር → intent ተረዳ:
-  - "ያዝ" / "ያዝልኝ" / "yaz" / "yazlgn" → booking
-  - "አለ" / "ale" / "new" / "yaze" / "alegn" / " አለ?" / "ነው?" / "ይቻላል?" → ጥያቄ → valid=false
-  - "ሰርዝ" / "cancel" / "ልቀቅ" → cancel
-ዋናው መርህ: ሰው ቁጥር ሊይዝ እንደፈለገ ግልጽ ካልሆነ → valid=false ምረጥ
+ጥያቄ መለየት:
+- "X አለ?" / "X new?" / "X ale?" / "X alegn?" → ጥያቄ
+- "ስንት ቀርቷል?" / "ዋጋው?" / "ሽልማቱ?" / "ሰላም" → ጥያቄ/ሰላምታ
+- context_info ተጠቅመህ ትክክለኛ መልስ ስጥ
+
+ዋናው መርህ: ሰው ምን እንደሚፈልግ ሙሉ context ተረድተህ ወስን — ምሳሌ ሳትጠብቅ።
 
 === አሁናዊ ሁኔታ ===
 {context_info}
@@ -289,7 +275,13 @@ name rule: መልእክቱ ውስጥ ሌላ ሰው ስም ካለ → name ስጥ
   "reply": null
 }}
 
-valid=false ከሆነ reply=አማርኛ መልስ፣ valid=true ከሆነ reply=null።
+swap ሲሆን:
+{{"intent": "swap", "cancel_number": 41, "book_numbers": [31, 41], "is_half": true, "name": null}}
+
+change_type ሲሆን:
+{{"intent": "change_type", "number": 21, "new_type": "half"}}
+
+valid=false → reply=አማርኛ | valid=true → reply=null
 JSON ብቻ። ምንም ማብራሪያ አታክል።"""
 
     result = addis_call(prompt, max_tokens=300, temperature=0.1)
@@ -535,6 +527,91 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 changed = True
             else:
                 not_yours.append(number)
+
+        # ── CHANGE TYPE ──
+        elif intent == "change_type":
+            new_type = action.get("new_type", "half")
+            if slot["type"] is None:
+                await update.message.reply_text(f"❌ {number}# ገና አልተያዘም።")
+            elif slot["p1_id"] != user_id and slot["p2_id"] != user_id:
+                await update.message.reply_text(f"❌ {number}# የእርስዎ አይደለም።")
+            elif slot["type"] == new_type:
+                await update.message.reply_text(f"🙏 {number}# ቀድሞ {'ግማሽ' if new_type=='half' else 'ሙሉ'} ነው!")
+            else:
+                if new_type == "half":
+                    # ሙሉ → ግማሽ
+                    data["slots"][slot_id].update({
+                        "type": "half",
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
+                    await update.message.reply_text(f"✅ {number}# ወደ ግማሽ ተቀይሯል። ገቢ 200ብር 🙏")
+                else:
+                    # ግማሽ → ሙሉ
+                    data["slots"][slot_id].update({
+                        "type": "full",
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
+                    })
+                    await update.message.reply_text(f"✅ {number}# ወደ ሙሉ ተቀይሯል። ገቢ 400ብር 🙏")
+                changed = True
+
+        # ── SWAP ──
+        elif intent == "swap":
+            cancel_number = action.get("cancel_number")
+            book_numbers  = action.get("book_numbers", [])
+            swap_half     = action.get("is_half", False)
+
+            # Cancel
+            if cancel_number:
+                c_slot_id, c_slot = get_slot_by_number(cancel_number, data)
+                if c_slot and (c_slot["p1_id"] == user_id or c_slot["p2_id"] == user_id):
+                    if c_slot["type"] == "half" and c_slot["p2_id"] is not None and c_slot["p1_id"] == user_id:
+                        data["slots"][c_slot_id].update({
+                            "p1_id": c_slot["p2_id"], "p1_name": c_slot["p2_name"],
+                            "p1_paid": c_slot["p2_paid"],
+                            "p2_id": None, "p2_name": None, "p2_paid": False,
+                        })
+                    elif c_slot["p2_id"] == user_id:
+                        data["slots"][c_slot_id].update({"p2_id": None, "p2_name": None, "p2_paid": False})
+                    else:
+                        saved_numbers = c_slot["numbers"]
+                        data["slots"][c_slot_id] = make_empty_slot(int(c_slot_id))
+                        data["slots"][c_slot_id]["numbers"] = saved_numbers
+                    cancelled.append(cancel_number)
+                    changed = True
+
+            # Book new numbers
+            for bn in book_numbers:
+                b_slot_id, b_slot = get_slot_by_number(bn, data)
+                if b_slot is None:
+                    continue
+                if swap_half:
+                    if b_slot["type"] is None:
+                        data["slots"][b_slot_id].update({
+                            "type": "half",
+                            "p1_id": user_id, "p1_name": display_name, "p1_paid": False,
+                            "p2_id": None, "p2_name": None, "p2_paid": False,
+                        })
+                        booked_half.append(bn)
+                        changed = True
+                    elif b_slot["type"] == "half" and b_slot["p2_id"] is None and b_slot["p1_id"] != user_id:
+                        data["slots"][b_slot_id].update({
+                            "p2_id": user_id, "p2_name": display_name, "p2_paid": False
+                        })
+                        half_joined.append(bn)
+                        changed = True
+                    else:
+                        already_taken.append(bn)
+                else:
+                    if b_slot["type"] is None:
+                        data["slots"][b_slot_id].update({
+                            "type": "full",
+                            "p1_id": user_id, "p1_name": display_name, "p1_paid": False,
+                            "p2_id": None, "p2_name": None, "p2_paid": False,
+                        })
+                        booked_full.append(bn)
+                        changed = True
+                    else:
+                        already_taken.append(bn)
 
     if changed:
         save_data(data)
