@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import base64
 import threading
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -10,7 +11,9 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes, Com
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DATA_FILE = "lottery_data.json"
+PAYMENTS_FILE = "payments.json"
 
 ADDIS_AI_KEYS = [
     os.getenv("ADDIS_AI_API_KEY_1"),
@@ -49,6 +52,64 @@ CBE 1000641057146 biniyam dawit
 አዋሽ  01335630641400
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
+
+# ==================== PAYMENTS DATA ====================
+
+def load_payments() -> dict:
+    if os.path.exists(PAYMENTS_FILE):
+        with open(PAYMENTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"verified": {}, "pending": {}}
+
+def save_payments(data: dict):
+    with open(PAYMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def save_verified_payment(ref: str, amount: float, sender: str):
+    """Admin SMS forward ሲመጣ ref ያስቀምጣል"""
+    payments = load_payments()
+    if ref not in payments["verified"]:
+        payments["verified"][ref] = {
+            "amount": amount,
+            "sender": sender,
+            "used": False,
+            "used_by": None
+        }
+        save_payments(payments)
+        print(f"✅ Payment saved: ref={ref}, amount={amount}")
+        return True
+    return False  # Already exists
+
+def find_verified_payment(ref: str) -> dict:
+    payments = load_payments()
+    return payments["verified"].get(ref)
+
+def mark_payment_used(ref: str, user_id: int):
+    payments = load_payments()
+    if ref in payments["verified"]:
+        payments["verified"][ref]["used"] = True
+        payments["verified"][ref]["used_by"] = user_id
+        save_payments(payments)
+
+def save_pending_payment(user_id: int, slot_id: str, amount: int, booking_type: str):
+    """User ቁጥር ሲይዝ pending payment ያስቀምጣል"""
+    payments = load_payments()
+    payments["pending"][str(user_id)] = {
+        "slot_id": slot_id,
+        "amount": amount,
+        "type": booking_type
+    }
+    save_payments(payments)
+
+def get_pending_payment(user_id: int) -> dict:
+    payments = load_payments()
+    return payments["pending"].get(str(user_id))
+
+def clear_pending_payment(user_id: int):
+    payments = load_payments()
+    if str(user_id) in payments["pending"]:
+        del payments["pending"][str(user_id)]
+        save_payments(payments)
 
 # ==================== DATA MANAGEMENT ====================
 
@@ -124,6 +185,90 @@ def _format_first_line(num: int, slot: dict) -> str:
 def build_full_message(data: dict) -> str:
     return LOTTERY_TEMPLATE.format(numbers=build_numbers_text(data))
 
+# ==================== CBE PAYMENT HELPERS ====================
+
+def extract_cbe_link(text: str) -> str:
+    match = re.search(r'https?://[Mm]breciept\.cbe\.com\.et/\S+', text)
+    return match.group(0).strip() if match else None
+
+def extract_amount_from_sms(text: str) -> float:
+    match = re.search(r'ETB\s*([\d,]+\.?\d*)', text)
+    if match:
+        return float(match.group(1).replace(",", ""))
+    return None
+
+def extract_sender_from_sms(text: str) -> str:
+    match = re.search(r'from\s+account\s+\S+\s+\(([^)]+)\)', text, re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+def fetch_ref_from_cbe_link(link: str) -> str:
+    """CBE link → image/page → Groq Vision → ref"""
+    try:
+        print(f"🔗 Fetching CBE link: {link}")
+        resp = requests.get(
+            link,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"},
+            stream=True
+        )
+        content_type = resp.headers.get("content-type", "image/jpeg")
+        image_data = resp.content
+        print(f"📄 Content-Type: {content_type}, Size: {len(image_data)} bytes")
+
+        # Groq Vision ይጠቀማል
+        ref = extract_ref_with_groq(image_data, content_type.split(";")[0].strip())
+        return ref
+    except Exception as e:
+        print(f"❌ CBE link fetch error: {e}")
+        return None
+
+def extract_ref_with_groq(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+    """Groq Vision → CBE receipt ላይ ref number ያወጣል"""
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{b64}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": """ይህ CBE (Commercial Bank of Ethiopia) receipt ነው።
+Reference No. ወይም VAT Receipt No. ያለውን code ብቻ አውጣ።
+FT የሚጀምር code ነው። ምሳሌ: FT26147TDW1K
+የ reference code ብቻ ፃፍ። ምንም ሌላ ቃል አትጨምር።"""
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 50
+            },
+            timeout=20
+        )
+        result = response.json()
+        text = result["choices"][0]["message"]["content"].strip()
+        print(f"🔍 Groq extracted: {text}")
+
+        # FT... format ያወጣል
+        match = re.search(r'[A-Z]{2}[A-Z0-9]{6,15}', text)
+        return match.group(0) if match else None
+    except Exception as e:
+        print(f"❌ Groq Vision error: {e}")
+        return None
+
 # ==================== ADDIS AI HELPERS ====================
 
 def addis_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str:
@@ -146,7 +291,6 @@ def addis_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> 
         print(f"❌ Addis AI call error: {e}")
         return ""
 
-
 def extract_numbers_from_text(text: str) -> list:
     matches = re.finditer(r'(?<!\d)(\d{1,3})(\+?)(?!\d)', text)
     seen = set()
@@ -158,7 +302,6 @@ def extract_numbers_from_text(text: str) -> list:
             seen.add(num)
             result.append((num, is_half))
     return result
-
 
 def detect_half_booking(raw_text: str) -> bool:
     lower = raw_text.lower()
@@ -173,11 +316,10 @@ def has_text(raw_text: str) -> bool:
     cleaned = re.sub(r'[\d\s\+\&\,፣#\.\/\*\-]|ብር|birr', '', raw_text, flags=re.IGNORECASE).strip()
     return len(cleaned) > 0
 
-
 def build_context_info(data: dict) -> str:
     filled = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
-    free_slots  = [s for s in data["slots"].values() if s["type"] is None]
-    half_open   = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
+    free_slots = [s for s in data["slots"].values() if s["type"] is None]
+    half_open  = [s for s in data["slots"].values() if s["type"] == "half" and s["p2_id"] is None]
 
     lines = [
         f"አጠቃላይ: {filled}/20 slots ሞልቷል",
@@ -185,7 +327,6 @@ def build_context_info(data: dict) -> str:
         "",
         "=== እያንዳንዱ slot ሁኔታ ===",
     ]
-
     for slot_id, slot in data["slots"].items():
         nums = f"{slot['numbers'][0]}-{slot['numbers'][-1]}"
         if slot["type"] is None:
@@ -200,21 +341,14 @@ def build_context_info(data: dict) -> str:
             else:
                 p2 = f"{slot['p2_name']} ({'✅' if slot['p2_paid'] else '⏳'})"
                 lines.append(f"slot{slot_id} [{nums}]: ግማሽ ሙሉ — {p1} + {p2}")
-
     if filled < 20:
         lines.append("\n⚠️ ሎተሪ ገና አልሞላም — ነፃ slots አሉ!")
     else:
         lines.append("\n✅ ሁሉም slots ተሞልቷል!")
-
     return "\n".join(lines)
-
 
 def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
              last_numbers: list = None, free_numbers: list = None) -> dict:
-    """
-    AI Brain — ቁጥር book/cancel ብቻ valid=true።
-    ሌላ ሁሉም (ጥያቄ፣ ሰላምታ፣ check፣ ወዘተ) → valid=false + reply።
-    """
     prompt = f"""አንተ የሎተሪ bot brain ነህ። JSON ብቻ መልስ። ምንም ሌላ ቃል አታክል።
 
 === ዋጋ ===
@@ -223,44 +357,18 @@ def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
 === Latin አማርኛ ===
 ሰዎች አማርኛን በ Latin ፊደል ይፅፋሉ (Ethiopic transliteration)።
 Latin ቃል ሲመጣ አማርኛ ነው — ሙሉ ፍቺውን ተረድተህ ስራ።
-ያልተዘረዘረ ቃልም ቢሆን context ተጠቅመህ ፍቺውን ተረዳ።
 
-=== Intents — ሁሉንም ተረዳ ===
-bot ሊያስተናግዳቸው የሚችላቸው intents:
-
-1. book — ቁጥር መያዝ
-   - number, is_half (true/false), name (ሌላ ሰው ስም ካለ)
-   - ቁጥር ብቻ ሲላክ → book, is_half=false
-   - ቁጥር+ ወይም "ግማሽ" ሲኖር → is_half=true
-   - ቁጥር ሳይኖር "ያዝልኝ/አዎ/እሺ" → last_numbers ተጠቀም: {last_numbers if last_numbers else "የሉም"}
-   - "ሁሉንም/ቀሪ ያዝልኝ" → free_numbers ሁሉ book: {free_numbers if free_numbers else "የሉም"}
-
-2. cancel — ቁጥር መሰረዝ
-   - number
-
-3. change_type — slot አይነት መቀየር
-   - number, new_type ("full" ወይም "half")
-   - "X ወደ ግማሽ ቀይር" → change_type, new_type="half"
-   - "X ወደ ሙሉ ቀይር" → change_type, new_type="full"
-
-4. swap — ቁጥሮች መቀያየር/መቀናበር
-   - cancel_number (የሚሰረዘው), book_numbers (የሚያዙት list), is_half
-   - "31+ እና 41+ ተካልኝ 41 ይቅር" → cancel 41, book 31+ እና 41+
-   - "X ሰርዘህ Y ያዝልኝ" → swap
-
-=== ጥያቄ vs Action ===
-ሰው action እንደፈለገ ግልጽ ከሆነ → valid=true
-ጥያቄ / information request / statement ከሆነ → valid=false + reply (አማርኛ፣ አጭር)
-
-ጥያቄ መለየት:
-- "X አለ?" / "X new?" / "X ale?" / "X alegn?" → ጥያቄ
-- "ስንት ቀርቷል?" / "ዋጋው?" / "ሽልማቱ?" / "ሰላም" → ጥያቄ/ሰላምታ
-- context_info ተጠቅመህ ትክክለኛ መልስ ስጥ
-
-ዋናው መርህ: ሰው ምን እንደሚፈልግ ሙሉ context ተረድተህ ወስን — ምሳሌ ሳትጠብቅ።
+=== Intents ===
+1. book — ቁጥር መያዝ (number, is_half, name)
+2. cancel — ቁጥር መሰረዝ (number)
+3. change_type — slot አይነት መቀየር (number, new_type)
+4. swap — ቁጥሮች መቀያየር (cancel_number, book_numbers, is_half)
 
 === አሁናዊ ሁኔታ ===
 {context_info}
+
+last_numbers: {last_numbers if last_numbers else "የሉም"}
+free_numbers: {free_numbers if free_numbers else "የሉም"}
 
 === ላኪ ===
 ስም: {sender_first_name}
@@ -275,14 +383,8 @@ bot ሊያስተናግዳቸው የሚችላቸው intents:
   "reply": null
 }}
 
-swap ሲሆን:
-{{"intent": "swap", "cancel_number": 41, "book_numbers": [31, 41], "is_half": true, "name": null}}
-
-change_type ሲሆን:
-{{"intent": "change_type", "number": 21, "new_type": "half"}}
-
 valid=false → reply=አማርኛ | valid=true → reply=null
-JSON ብቻ። ምንም ማብራሪያ አታክል።"""
+JSON ብቻ።"""
 
     result = addis_call(prompt, max_tokens=300, temperature=0.1)
     print(f"🧠 AI brain raw: {result}")
@@ -290,12 +392,10 @@ JSON ብቻ። ምንም ማብራሪያ አታክል።"""
     try:
         match = re.search(r'\{.*\}', result, re.DOTALL)
         if match:
-            parsed = json.loads(match.group())
-            return parsed
+            return json.loads(match.group())
     except Exception as e:
-        print(f"❌ ai_brain parse error: {e} | raw: {result}")
+        print(f"❌ ai_brain parse error: {e}")
 
-    # Fallback — ቁጥሮች ካሉ book
     nums = extract_numbers_from_text(raw_text)
     is_half = detect_half_booking(raw_text)
     if nums:
@@ -306,32 +406,27 @@ JSON ብቻ። ምንም ማብራሪያ አታክል።"""
         }
     return {"actions": [], "valid": False, "reply": "❓ ልረዳህ አልቻልኩም። ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
 
-
 # ==================== BOT HANDLERS ====================
 
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
         return
-
     data = load_data()
     data["slots"] = {str(i): make_empty_slot(i) for i in range(1, 21)}
-
     sent = await update.message.reply_text(build_full_message(data))
     data["lottery_message_id"] = sent.message_id
     data["chat_id"] = update.effective_chat.id
     save_data(data)
     await update.message.reply_text("✅ ሎተሪ ጀምሯል!")
 
-
 async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin manually paid ሊያደርግ ከፈለገ"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
-
     if not context.args:
-        await update.message.reply_text("አጠቃቀም:\n/paid <ቁጥር>      → ሙሉ ወይም ግማሽ p1\n/paid <ቁጥር> 2   → ግማሽ p2")
+        await update.message.reply_text("አጠቃቀም:\n/paid <ቁጥር>\n/paid <ቁጥር> 2")
         return
-
     try:
         number = int(context.args[0])
     except ValueError:
@@ -347,7 +442,6 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     slot_id, slot = get_slot_by_number(number, data)
-
     if not slot:
         await update.message.reply_text("❌ ቁጥር አልተገኘም")
         return
@@ -369,11 +463,9 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_lottery_message(context.bot, data)
     await update.message.reply_text(f"✅ {name} ክፍያ ተረጋግጧል!")
 
-
 async def update_lottery_message(bot: Bot, data: dict):
     msg_id = data.get("lottery_message_id")
     chat_id = data.get("chat_id")
-    print(f"🔄 update_lottery_message: chat_id={chat_id}, message_id={msg_id}")
     if msg_id and chat_id:
         try:
             await bot.edit_message_text(
@@ -381,19 +473,153 @@ async def update_lottery_message(bot: Bot, data: dict):
                 message_id=msg_id,
                 text=build_full_message(data)
             )
-            print("✅ Lottery message updated successfully")
         except Exception as e:
             print(f"❌ Message update error: {e}")
             try:
                 sent = await bot.send_message(chat_id=chat_id, text=build_full_message(data))
                 data["lottery_message_id"] = sent.message_id
                 save_data(data)
-                print(f"✅ Sent new lottery message id={sent.message_id}")
             except Exception as e2:
                 print(f"❌ Send new message error: {e2}")
-    else:
-        print("⚠️ No lottery_message_id or chat_id — cannot update")
 
+# ==================== PAYMENT: SCREENSHOT HANDLER ====================
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User screenshot ሲልክ — CBE ref ያረጋግጣል"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Pending payment አለ?
+    pending = get_pending_payment(user_id)
+    if not pending:
+        await update.message.reply_text(
+            "❓ መጀመሪያ ቁጥር ይያዙ፣ ከዚያ screenshot ይላኩ።"
+        )
+        return
+
+    await update.message.reply_text("⏳ ክፍያ እየተረጋገጠ ነው...")
+
+    # Photo ያወርዳል
+    photos = update.message.photo
+    largest = photos[-1]
+    file = await context.bot.get_file(largest.file_id)
+    image_bytes = await file.download_as_bytearray()
+
+    # Groq Vision → ref
+    ref = extract_ref_with_groq(bytes(image_bytes), "image/jpeg")
+
+    if not ref:
+        await update.message.reply_text(
+            "❌ Reference number ማንበብ አልተቻለም።\n"
+            "CBE receipt screenshot ትክክለኛ መሆኑን ያረጋግጡ።"
+        )
+        return
+
+    print(f"📋 Extracted ref: {ref}")
+
+    # DB ውስጥ ይፈልጋል
+    payment = find_verified_payment(ref)
+
+    if not payment:
+        await update.message.reply_text(
+            f"❌ ይህ ክፍያ አልተረጋገጠም!\n\n"
+            f"📋 Ref: {ref}\n\n"
+            f"Admin ገና SMS አልደረሰውም። ትንሽ ቆይተው እንደገና ይሞክሩ።"
+        )
+        return
+
+    if payment["used"]:
+        await update.message.reply_text(
+            f"⚠️ ይህ ክፍያ ቀድሞ ጥቅም ላይ ውሏል!\n\nRef: {ref}"
+        )
+        return
+
+    # Amount ይፈትሻል
+    expected_amount = pending["amount"]
+    paid_amount = payment.get("amount", 0)
+
+    if paid_amount and paid_amount < expected_amount:
+        await update.message.reply_text(
+            f"❌ ክፍያ አይሆንም!\n\n"
+            f"💰 የተከፈለ: ETB {paid_amount}\n"
+            f"💰 የሚፈለግ: ETB {expected_amount}\n\n"
+            f"ትክክለኛ መጠን ይክፈሉ።"
+        )
+        return
+
+    # ✅ ሁሉም ተሟልቷል — slot paid ያደርጋል
+    data = load_data()
+    slot_id = pending["slot_id"]
+    slot = data["slots"].get(slot_id)
+
+    if not slot:
+        await update.message.reply_text("❌ Slot አልተገኘም።")
+        return
+
+    # p1 ወይም p2 paid ያደርጋል
+    if slot["p1_id"] == user_id:
+        data["slots"][slot_id]["p1_paid"] = True
+    elif slot["p2_id"] == user_id:
+        data["slots"][slot_id]["p2_paid"] = True
+
+    save_data(data)
+    mark_payment_used(ref, user_id)
+    clear_pending_payment(user_id)
+
+    await update_lottery_message(context.bot, data)
+
+    sender = payment.get("sender", "Unknown")
+    await update.message.reply_text(
+        f"✅ ክፍያ ተረጋግጧል!\n\n"
+        f"📋 Ref: {ref}\n"
+        f"💰 ETB {paid_amount}\n"
+        f"👤 {sender}\n\n"
+        f"🎰 መልካም ዕድል!"
+    )
+
+    # ሁሉም ሞልቷል?
+    data = load_data()
+    if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
+        await context.bot.send_message(chat_id, "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
+
+# ==================== PAYMENT: ADMIN SMS HANDLER ====================
+
+async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Admin CBE SMS forward ሲልክ"""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("⏳ CBE receipt እየተረጋገጠ ነው...")
+
+    link = extract_cbe_link(text)
+    amount = extract_amount_from_sms(text)
+    sender = extract_sender_from_sms(text)
+
+    if not link:
+        await update.message.reply_text("❌ CBE link አልተገኘም።")
+        return
+
+    ref = fetch_ref_from_cbe_link(link)
+
+    if not ref:
+        await update.message.reply_text(
+            "❌ Ref number ማወጣት አልተቻለም።\n"
+            "CBE receipt page ለጊዜው ተዘግቷል ይሆናል።"
+        )
+        return
+
+    already = save_verified_payment(ref, amount or 0, sender or "Unknown")
+
+    if not already:
+        await update.message.reply_text(f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!\nRef: {ref}")
+        return
+
+    await update.message.reply_text(
+        f"✅ Payment ተመዝግቧል!\n\n"
+        f"📋 Ref: {ref}\n"
+        f"💰 Amount: ETB {amount}\n"
+        f"👤 Sender: {sender or 'Unknown'}"
+    )
+
+# ==================== MAIN MESSAGE HANDLER ====================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -403,28 +629,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_first_name = update.effective_user.first_name or "ተጠቃሚ"
     user_id = update.effective_user.id
     data = load_data()
-    context_info = build_context_info(data)
 
+    # ── ADMIN: CBE SMS forward ──
+    if user_id == ADMIN_TELEGRAM_ID and "Mbreciept.cbe.com.et" in raw_text:
+        await handle_admin_sms(update, context, raw_text)
+        return
+
+    context_info = build_context_info(data)
     number_list = extract_numbers_from_text(raw_text)
 
-    # ቀዳሚ ቁጥሮች — ይህ user ያሳለፋቸው ቁጥሮች
     user_id_str = str(user_id)
     last_numbers = data.get("last_numbers_per_user", {}).get(user_id_str, [])
-
-    # ነፃ slots የመጀመሪያ ቁጥሮች
     free_numbers = [s["numbers"][0] for s in data["slots"].values() if s["type"] is None]
 
-    # ቁጥሮች ካሉ → save as last_numbers
     if number_list:
         data.setdefault("last_numbers_per_user", {})[user_id_str] = [n for n, h in number_list]
         save_data(data)
 
     if has_text(raw_text):
-        # AI Brain — ቁጥር book/cancel ብቻ valid=true፣ ሌላ ሁሉም false
         brain = ai_brain(raw_text, sender_first_name, context_info, last_numbers, free_numbers)
-        valid  = brain.get("valid", False)
-        reply  = brain.get("reply", None)
-        print(f"🧠 brain={brain}")
+        valid = brain.get("valid", False)
+        reply = brain.get("reply", None)
 
         if not valid or not brain.get("actions"):
             await update.message.reply_text(reply or "❓ ልረዳህ አልቻልኩም።")
@@ -432,27 +657,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         actions = brain.get("actions", [])
     else:
-        # Bot ቀጥታ — ቁጥሮች ብቻ
         if not number_list:
             await update.message.reply_text("❓ ቁጥር ፃፍ። ለምሳሌ: 21 ወይም 21+")
             return
         actions = [{"intent": "book", "number": n, "is_half": h, "name": None} for n, h in number_list]
 
     # ==================== ACTIONS ====================
-    booked_full  = []
-    booked_half  = []
-    half_joined  = []
+    booked_full   = []
+    booked_half   = []
+    half_joined   = []
     already_taken = []
-    cancelled    = []
-    not_yours    = []
+    cancelled     = []
+    not_yours     = []
+    changed       = False
 
-    changed = False
+    # ── ለ pending payment slot_id ──
+    last_booked_slot_id = None
+    last_booked_amount  = 0
+    last_booked_type    = "full"
 
     for action in actions:
-        intent  = action.get("intent", "book")
-        number  = action.get("number")
-        is_half = action.get("is_half", False)
-        ai_name = action.get("name")
+        intent      = action.get("intent", "book")
+        number      = action.get("number")
+        is_half     = action.get("is_half", False)
+        ai_name     = action.get("name")
         display_name = ai_name if ai_name else sender_first_name
 
         if not number:
@@ -469,15 +697,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data["slots"][slot_id].update({
                         "type": "half",
                         "p1_id": user_id, "p1_name": display_name, "p1_paid": False,
-                        "p2_id": None,    "p2_name": None,          "p2_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
                     })
                     booked_half.append(number)
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 200
+                    last_booked_type    = "half"
                     changed = True
                 elif slot["type"] == "half" and slot["p2_id"] is None and slot["p1_id"] != user_id:
                     data["slots"][slot_id].update({
                         "p2_id": user_id, "p2_name": display_name, "p2_paid": False
                     })
                     half_joined.append(number)
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 200
+                    last_booked_type    = "half"
                     changed = True
                 elif slot["type"] == "half" and slot["p1_id"] == user_id:
                     await update.message.reply_text(f"⚠️ {number}# ቀድሞ ይዘሃል!")
@@ -488,16 +722,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data["slots"][slot_id].update({
                         "type": "full",
                         "p1_id": user_id, "p1_name": display_name, "p1_paid": False,
-                        "p2_id": None,    "p2_name": None,          "p2_paid": False,
+                        "p2_id": None, "p2_name": None, "p2_paid": False,
                     })
                     booked_full.append(number)
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 400
+                    last_booked_type    = "full"
                     changed = True
                 elif slot["type"] == "half" and slot["p2_id"] is None and slot["p1_id"] != user_id:
-                    # ግማሽ ክፍት እያለ ሙሉ ቢፅፍ → ግማሽ ያደርብለታል
                     data["slots"][slot_id].update({
                         "p2_id": user_id, "p2_name": display_name, "p2_paid": False
                     })
                     half_joined.append(number)
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 200
+                    last_booked_type    = "half"
                     changed = True
                 elif slot["p1_id"] == user_id or slot["p2_id"] == user_id:
                     await update.message.reply_text(f"🙏 {number}# ቀድሞ ይዘሃል!")
@@ -520,10 +759,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data["slots"][slot_id] = make_empty_slot(int(slot_id))
                     data["slots"][slot_id]["numbers"] = saved_numbers
                 cancelled.append(number)
+                clear_pending_payment(user_id)
                 changed = True
             elif slot["type"] == "half" and slot["p2_id"] == user_id:
                 data["slots"][slot_id].update({"p2_id": None, "p2_name": None, "p2_paid": False})
                 cancelled.append(number)
+                clear_pending_payment(user_id)
                 changed = True
             else:
                 not_yours.append(number)
@@ -539,19 +780,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"🙏 {number}# ቀድሞ {'ግማሽ' if new_type=='half' else 'ሙሉ'} ነው!")
             else:
                 if new_type == "half":
-                    # ሙሉ → ግማሽ
                     data["slots"][slot_id].update({
                         "type": "half",
                         "p2_id": None, "p2_name": None, "p2_paid": False,
                     })
                     await update.message.reply_text(f"✅ {number}# ወደ ግማሽ ተቀይሯል። ገቢ 200ብር 🙏")
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 200
+                    last_booked_type    = "half"
                 else:
-                    # ግማሽ → ሙሉ
                     data["slots"][slot_id].update({
                         "type": "full",
                         "p2_id": None, "p2_name": None, "p2_paid": False,
                     })
                     await update.message.reply_text(f"✅ {number}# ወደ ሙሉ ተቀይሯል። ገቢ 400ብር 🙏")
+                    last_booked_slot_id = slot_id
+                    last_booked_amount  = 400
+                    last_booked_type    = "full"
                 changed = True
 
         # ── SWAP ──
@@ -560,7 +805,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             book_numbers  = action.get("book_numbers", [])
             swap_half     = action.get("is_half", False)
 
-            # Cancel
             if cancel_number:
                 c_slot_id, c_slot = get_slot_by_number(cancel_number, data)
                 if c_slot and (c_slot["p1_id"] == user_id or c_slot["p2_id"] == user_id):
@@ -579,7 +823,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cancelled.append(cancel_number)
                     changed = True
 
-            # Book new numbers
             for bn in book_numbers:
                 b_slot_id, b_slot = get_slot_by_number(bn, data)
                 if b_slot is None:
@@ -592,12 +835,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "p2_id": None, "p2_name": None, "p2_paid": False,
                         })
                         booked_half.append(bn)
+                        last_booked_slot_id = b_slot_id
+                        last_booked_amount  = 200
+                        last_booked_type    = "half"
                         changed = True
                     elif b_slot["type"] == "half" and b_slot["p2_id"] is None and b_slot["p1_id"] != user_id:
                         data["slots"][b_slot_id].update({
                             "p2_id": user_id, "p2_name": display_name, "p2_paid": False
                         })
                         half_joined.append(bn)
+                        last_booked_slot_id = b_slot_id
+                        last_booked_amount  = 200
+                        last_booked_type    = "half"
                         changed = True
                     else:
                         already_taken.append(bn)
@@ -609,6 +858,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "p2_id": None, "p2_name": None, "p2_paid": False,
                         })
                         booked_full.append(bn)
+                        last_booked_slot_id = b_slot_id
+                        last_booked_amount  = 400
+                        last_booked_type    = "full"
                         changed = True
                     else:
                         already_taken.append(bn)
@@ -619,13 +871,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── REPLIES ──
     if booked_full:
-        await update.message.reply_text(f"እሺ ገቢ {len(booked_full) * 400}ብር 🙏")
+        total = len(booked_full) * 400
+        await update.message.reply_text(
+            f"እሺ ገቢ {total}ብር 🙏\n\n"
+            f"💳 CBE: 1000641057146\n"
+            f"💳 አዋሽ: 01335630641400\n"
+            f"💳 ዳሽን: 5389857825011\n"
+            f"📱 ቴሌ ብር: 0952346729\n\n"
+            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
+        )
+        if last_booked_slot_id:
+            save_pending_payment(user_id, last_booked_slot_id, last_booked_amount, last_booked_type)
 
     if booked_half:
-        await update.message.reply_text(f"እሺ ገቢ {len(booked_half) * 200}ብር 🙏")
+        total = len(booked_half) * 200
+        await update.message.reply_text(
+            f"እሺ ገቢ {total}ብር 🙏\n\n"
+            f"💳 CBE: 1000641057146\n"
+            f"💳 አዋሽ: 01335630641400\n"
+            f"💳 ዳሽን: 5389857825011\n"
+            f"📱 ቴሌ ብር: 0952346729\n\n"
+            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
+        )
+        if last_booked_slot_id:
+            save_pending_payment(user_id, last_booked_slot_id, last_booked_amount, last_booked_type)
 
     if half_joined:
-        await update.message.reply_text(f"✅ ተቀላቅለሃል! slot ሙሉ ሆኗል 🎉 እሺ ገቢ 200ብር 🙏")
+        await update.message.reply_text(
+            f"✅ ተቀላቅለሃል! slot ሙሉ ሆኗል 🎉 እሺ ገቢ 200ብር 🙏\n\n"
+            f"💳 CBE: 1000641057146\n\n"
+            f"✅ ከፈሉ በኋላ screenshot ይላኩ!"
+        )
+        if last_booked_slot_id:
+            save_pending_payment(user_id, last_booked_slot_id, 200, "half")
 
     if cancelled:
         await update.message.reply_text("✅ ተሰርዟል።")
@@ -677,12 +955,10 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start_lottery", start_lottery))
     app.add_handler(CommandHandler("paid", mark_paid))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded:")
-    for i, key in enumerate(ADDIS_AI_KEYS):
-        masked = key[:8] + "..." + key[-4:] if len(key) > 12 else "SHORT_KEY"
-        print(f"  Key {i+1}: {masked}")
+    print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded")
     print("✅ Bot እየሰራ ነው...")
     app.run_polling(drop_pending_updates=True)
 
