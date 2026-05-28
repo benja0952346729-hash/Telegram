@@ -159,7 +159,6 @@ def build_progress_bar(percent: float, width: int = 10) -> str:
 def build_804_report() -> str:
     rows = get_usage_last_5_days()
     metrics = get_system_metrics()
-    gemini_daily_limit = len([k for k in GEMINI_KEYS if k]) * 1500
 
     lines = ["📊 *Bot Resource Report*", ""]
 
@@ -172,29 +171,21 @@ def build_804_report() -> str:
 
     if rows:
         today = rows[0]
-        gemini_today = today[1] or 0
         groq_today = today[2] or 0
-        gemini_pct = round((gemini_today / gemini_daily_limit) * 100, 1) if gemini_daily_limit > 0 else 0
-
-        lines.append("🤖 *Gemini API — ዛሬ*")
-        lines.append(f"  ጥቅም: `{gemini_today} / {gemini_daily_limit}`")
-        lines.append(f"  {build_progress_bar(gemini_pct)}")
-        lines.append("")
-
         lines.append("⚡ *Groq API — ዛሬ*")
         lines.append(f"  ጥቅም: `{groq_today}` calls")
         lines.append("")
 
     lines.append("📅 *የ 5 ቀን Usage*")
     lines.append("```")
-    lines.append(f"{'ቀን':<10} {'Gem':>5} {'Groq':>5} {'Msg':>5} {'📷':>4} {'SMS':>4} {'✅':>4} {'❌':>4}")
-    lines.append("─" * 46)
+    lines.append(f"{'ቀን':<10} {'Groq':>5} {'Msg':>5} {'📷':>4} {'SMS':>4} {'✅':>4} {'❌':>4}")
+    lines.append("─" * 42)
 
     for row in rows:
         day, gemini, groq, db_q, msgs, photos, sms, auto_app, errors = row
         day_str = day.strftime("%m/%d") if hasattr(day, "strftime") else str(day)
         lines.append(
-            f"{day_str:<10} {gemini or 0:>5} {groq or 0:>5} "
+            f"{day_str:<10} {groq or 0:>5} "
             f"{msgs or 0:>5} {photos or 0:>4} {sms or 0:>4} "
             f"{auto_app or 0:>4} {errors or 0:>4}"
         )
@@ -204,8 +195,8 @@ def build_804_report() -> str:
 
     lines.append("```")
     lines.append("")
-    lines.append("_Gem=Gemini | Groq=Groq | Msg=Messages_")
-    lines.append("_📷=Photos | SMS=SMS | ✅=AutoApproved | ❌=Errors_")
+    lines.append("_Groq=Groq calls | Msg=Messages | 📷=Photos_")
+    lines.append("_SMS=SMS | ✅=AutoApproved | ❌=Errors_")
     lines.append("")
     lines.append(f"_🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}_")
 
@@ -553,140 +544,52 @@ FT የሚጀምር code ነው። ምሳሌ: FT26147TDW1K
         increment_counter("errors")
         return None
 
-# ==================== GEMINI AI HELPERS ====================
+# ==================== GROQ AI BRAIN ====================
 
-GEMINI_KEYS = [
-    os.getenv("GEMINI_API_KEY_1"),
-    os.getenv("GEMINI_API_KEY_2"),
-    os.getenv("GEMINI_API_KEY_3"),
-    os.getenv("GEMINI_API_KEY_4"),
-    os.getenv("GEMINI_API_KEY_5"),
-    os.getenv("GEMINI_API_KEY_6"),
-    os.getenv("GEMINI_API_KEY_7"),
-    os.getenv("GEMINI_API_KEY_8"),
-]
-GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
-gemini_key_index = 0
+def groq_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+    """Groq API call — ፈጣን፣ ነፃ፣ አማርኛ ይችላል"""
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a JSON-only responder. You MUST respond with valid JSON only. No markdown, no backticks, no explanation. Only a raw JSON object."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "response_format": {"type": "json_object"}  # JSON mode — ስህተት ዜሮ!
+            },
+            timeout=20
+        )
+        result = response.json()
 
-def get_next_gemini_key() -> str:
-    global gemini_key_index
-    key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
-    gemini_key_index += 1
-    return key
+        if response.status_code != 200:
+            print(f"❌ Groq error {response.status_code}: {result}")
+            increment_counter("errors")
+            return ""
 
-GEMINI_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash",
-    "gemini-2.0-flash",
-]
+        text = result["choices"][0]["message"]["content"].strip()
+        print(f"⚡ Groq response: {text[:100]}")
+        increment_counter("groq_calls")
+        return text
 
-def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
-    last_error = None
-    print(f"🔑 Gemini keys loaded: {len(GEMINI_KEYS)}")
-    if not GEMINI_KEYS:
-        print("❌ CRITICAL: No Gemini keys found in environment!")
+    except Exception as e:
+        print(f"❌ Groq call error: {e}")
+        increment_counter("errors")
         return ""
 
-    for model in GEMINI_MODELS:
-        for attempt in range(len(GEMINI_KEYS)):
-            key = get_next_gemini_key()
-            key_preview = key[:8] + "..." if key else "None"
-            try:
-                print(f"🚀 Trying {model} key {attempt+1} ({key_preview})")
-                response = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {
-                            "temperature": temperature,
-                            "maxOutputTokens": max_tokens
-                        }
-                    },
-                    timeout=20
-                )
-                print(f"📡 Status: {response.status_code} | Model: {model} | Key: {attempt+1}")
-
-                if response.status_code == 429:
-                    body = response.text[:300]
-                    print(f"⚠️ 429 Rate limited — {model} key {attempt+1}: {body}")
-                    last_error = "429"
-                    # ── ተራ በተራ ለመግባት delay ──
-                    wait = 2 + attempt * 1  # key 1→2s, key 2→3s, key 3→4s ...
-                    print(f"⏳ Waiting {wait}s before next key...")
-                    time.sleep(wait)
-                    continue
-
-                if response.status_code == 400:
-                    body = response.text[:300]
-                    print(f"❌ 400 Bad Request — {model} key {attempt+1}: {body}")
-                    last_error = f"400: {body}"
-                    continue
-
-                if response.status_code == 403:
-                    body = response.text[:300]
-                    print(f"❌ 403 Forbidden (invalid key?) — {model} key {attempt+1}: {body}")
-                    last_error = f"403: {body}"
-                    continue
-
-                if response.status_code != 200:
-                    body = response.text[:300]
-                    print(f"⚠️ HTTP {response.status_code} — {model} key {attempt+1}: {body}")
-                    last_error = f"{response.status_code}: {body}"
-                    continue
-
-                data = response.json()
-
-                if not data.get("candidates"):
-                    print(f"⚠️ Empty candidates — {model} key {attempt+1}: {data}")
-                    last_error = "empty candidates"
-                    continue
-
-                text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                print(f"✅ Gemini OK ({model}, key {attempt+1}): {text[:80]}")
-                increment_counter("gemini_calls")
-                return text
-
-            except requests.exceptions.Timeout:
-                print(f"⏱️ Timeout — {model} key {attempt+1}")
-                last_error = "timeout"
-                increment_counter("errors")
-                continue
-            except Exception as e:
-                print(f"❌ Exception — {model} key {attempt+1}: {type(e).__name__}: {e}")
-                last_error = str(e)
-                increment_counter("errors")
-                continue
-
-        print(f"⚠️ All keys failed for {model}, trying next model...")
-
-    print(f"❌ ALL Gemini models and keys failed. Last error: {last_error}")
-    return ""
-
-def extract_numbers_from_text(text: str) -> list:
-    matches = re.finditer(r'(?<!\d)(\d{1,3})(\+?)(?!\d)', text)
-    seen = set()
-    result = []
-    for m in matches:
-        num = int(m.group(1))
-        is_half = m.group(2) == '+'
-        if 1 <= num <= 100 and num not in seen:
-            seen.add(num)
-            result.append((num, is_half))
-    return result
-
-def detect_half_booking(raw_text: str) -> bool:
-    lower = raw_text.lower()
-    half_keywords = ["ግማሽ", "half", "begmash", "grmash", "gmash", "200"]
-    if any(k in lower for k in half_keywords):
-        return True
-    if re.search(r'\d+\s*\+', raw_text):
-        return True
-    return False
-
-def has_text(raw_text: str) -> bool:
-    cleaned = re.sub(r'[\d\s\+\&\,፣#\.\/\*\-]|ብር|birr', '', raw_text, flags=re.IGNORECASE).strip()
-    return len(cleaned) > 0
 
 def build_context_info(data: dict) -> str:
     filled = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
@@ -720,93 +623,57 @@ def build_context_info(data: dict) -> str:
         lines.append("\n✅ ሁሉም slots ተሞልቷል!")
     return "\n".join(lines)
 
-# ==================== AI BRAIN ====================
 
 def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
              last_numbers: list = None, free_numbers: list = None) -> dict:
 
-    prompt = f"""አንተ ልምድ ያለው የሎተሪ ረዳት ነህ። ሰዎችን ያለ admin ሙሉ በሙሉ ማስተናገድ ይኖርብሃል።
-JSON ብቻ መልስ። ምንም markdown፣ backtick፣ ወይም ሌላ text አታክል።
+    prompt = f"""አንተ ልምድ ያለው የሎተሪ ረዳት ነህ። JSON ONLY። ምንም ሌላ text አትጻፍ።
 
 ══════════════════════════════
-🎰 ጨዋታው እንዴት ነው? (ሙሉ እውቀት)
+🎰 ጨዋታው
 ══════════════════════════════
-- ጠቅላላ 20 slots አሉ፣ እያንዳንዱ slot 5 ቁጥሮች (1-5, 6-10, 11-15 ... 96-100)
-- ሙሉ slot = 1 ሰው 400ብር ይከፍላል፣ 5 ቁጥሮቹን ሙሉ ለሙሉ ይወስዳል
-- ግማሽ slot = 2 ሰው ይካፈላሉ፣ እያንዳንዱ 200ብር ይከፍላል፣ ቁጥሮቹን አብረው ይያዛሉ
-- ሁሉም 20 slots ሲሞሉ ዕጣ ይወጣል
+- 20 slots አሉ። እያንዳንዱ slot 5 ቁጥሮች (1-5, 6-10, ... 96-100)
+- ሙሉ slot = 1 ሰው 400ብር፣ 5 ቁጥሮች ሙሉ
+- ግማሽ slot = 2 ሰው ይካፈላሉ፣ እያንዳንዱ 200ብር
 - ሽልማቶች: 1ኛ=5000ብር | 2ኛ=1000ብር | 3ኛ=400ብር
-- ክፍያ ዘዴዎች: CBE 1000641057146 | አዋሽ 01335630641400 | ዳሽን 5389857825011 | ቴሌ ብር 0952346729
-- ቁጥር ከያዙ በኋላ → ክፍያ ይፈጸማል → screenshot ይላካል → admin ያረጋግጣል → ✅
+- ክፍያ: CBE 1000641057146 | አዋሽ 01335630641400 | ዳሽን 5389857825011 | ቴሌ ብር 0952346729
 
 ══════════════════════════════
-🗣️ አንተ እንዴት ትናገራለህ?
-══════════════════════════════
-- ሰዎችን ሞቅ ባለ፣ ቀላል አማርኛ ታናግራቸዋለህ
-- ጥያቄ ሲጠይቁ context ተጠቅመህ ሙሉ፣ ጠቃሚ፣ አጭር መልስ ትሰጣለህ
-- ካልገባቸው ታብራራለህ፣ ካጠራጠሩ ትረዳቸዋለህ
-- "ልረዳህ አልቻልኩም" ፈጽሞ አትበል — context ውስጥ መልሱ ሁልጊዜ አለ
-- ራስህን አታስተዋውቅ፣ "ምን ልርዳህ?" አትጠይቅ — ቀጥታ መልስ ስጥ
-
-══════════════════════════════
-🌐 ቋንቋ ማወቅ — Latin አማርኛ ሁሉ ተረዳ
+🌐 Latin አማርኛ slang — ሁሉ ተረዳ
 ══════════════════════════════
 yaz/yazlgn = ያዝልኝ | srez/sirez = ሰርዝ | gmash/grmash/begmash = ግማሽ
-nefta ale = ነፃ አለ? | sint bir = ስንት ብር? | yemeta = የቀረ? | ale = አለ?
-tekayelgn = ተካልኝ | endet = እንዴት | mecheresha = ምን ያህል
-hulum = ሁሉም | kefelku = ከፈልኩ | screenshot = ስክሪንሾት
+nefta ale = ነፃ አለ? | sint bir = ስንት ብር? | yemeta = የቀረ?
+tekayelgn = ተካልኝ | endet = እንዴት | hulum = ሁሉም | kefelku = ከፈልኩ
 
 ══════════════════════════════
-💬 ጥያቄ ሲመጣ — ትክክለኛ መልሶች
+⚡ Actions
 ══════════════════════════════
-"ቁጥሮች አሉ?" / "ነፃ አለ?" / "nefta ale?" / "ቁጥር አለ?"
-→ context_info ውስጥ ነፃ slots ቁጥር ተጠቀም። "አዎ X ቁጥሮች ነፃ አሉ ✅" ወይም "ሁሉም ተይዟል ❌"
+1. book — ቁጥር ሲያዝ
+   - ቁጥር ብቻ → is_half=false
+   - ቁጥር+ ወይም gmash/200/ግማሽ → is_half=true
+   - "yazlgn/ያዝልኝ/አዎ/እሺ" ቁጥር ሳይኖር → last_numbers ተጠቀም: {last_numbers or []}
+   - "hulum/ቀሪውን ያዝልኝ" → free_numbers ሁሉ: {free_numbers or []}
+   - ሌላ ሰው ስም ካለ → name field ሙላ
 
-"ስንት ቀርቷል?" / "yemeta?" / "ስንት ነፃ ነው?"
-→ ነፃ slots × 5 ቁጥሮች ስሌት ተጠቀም
-
-"ዋጋው ስንት?" / "sint bir?"
-→ "ሙሉ=400ብር (5 ቁጥሮች)፣ ግማሽ=200ብር (5 ቁጥሮች 2 ሰው ይካፈላሉ)"
-
-"ሽልማቱ ስንት?" / "ena zer"
-→ "1ኛ=5000ብር 🥇 | 2ኛ=1000ብር 🥈 | 3ኛ=400ብር 🥉"
-
-"እንዴት ነው ጨዋታው?" / "explain" / "እንዴት?"
-→ ጨዋታውን አጭር ቢሆን ሙሉ ማብራሪያ ስጥ፦ ቁጥር ምረጥ → ክፈል → screenshot ላክ → ዕጣ ጠብቅ
-
-"ስንት ሰው ነው?" / "for how many?"
-→ "20 ሰው ብቻ ነው። አሁን X slot ቀርቷል 🎰"
-
-"እኔ ቁጥር ይዣለሁ?" / "yaze ale?"
-→ context_info ውስጥ ሰውዬው ስም ፈልግ። ካለ "አዎ [ቁጥር] ይዘሃል"። ከሌለ "ቁጥር ገና አልያዝክም"
-
-"ክፍያ እንዴት?" / "payment"
-→ "ቁጥር ከያዙ ወደ ታች ወዳሉት bank account ይክፈሉ፣ screenshot ያንዱ ወደ bot ይላኩ።
-   CBE: 1000641057146 | አዋሽ: 01335630641400 | ዳሽን: 5389857825011 | ቴሌ ብር: 0952346729"
-
-"ሰላም" / "hi" / "hello"
-→ "ሰላም {sender_first_name}! 🎰 ቁጥር ይያዙ — {len([s for s in context_info.split(chr(10)) if 'ነፃ ✅' in s])} slot ነፃ አለ!"
-
-══════════════════════════════
-⚡ Actions (valid=true)
-══════════════════════════════
-1. book — ቁጥር መያዝ
-   ቁጥር ብቻ → is_half=false
-   ቁጥር+ ወይም "ግማሽ/gmash/200" → is_half=true
-   "ያዝልኝ/yazlgn/አዎ/እሺ/ishi" ቁጥር ሳይኖር → last_numbers ተጠቀም: {last_numbers if last_numbers else "[]"}
-   "ሁሉንም/hulum/ቀሪውን ያዝልኝ" → free_numbers: {free_numbers if free_numbers else "[]"}
-   ሌላ ሰው ስም ካለ → name field ሙላ
-
-2. cancel — ቁጥር መሰረዝ
-   "ሰርዝ/srez/sirez/cancel/yikar/ይቅር" + ቁጥር
+2. cancel — ሲሰርዝ
+   - "ሰርዝ/srez/cancel" + ቁጥር
 
 3. change_type — slot አይነት መቀየር
-   "X ወደ ግማሽ ቀይር" → new_type="half"
-   "X ወደ ሙሉ ቀይር" → new_type="full"
+   - "X ወደ ግማሽ ቀይር" → new_type="half"
+   - "X ወደ ሙሉ ቀይር" → new_type="full"
 
-4. swap — ሰርዞ ማዝ
-   "X ሰርዘህ Y ያዝልኝ" / "X ተካልኝ Y"
-   cancel_number + book_numbers list
+4. swap — ሰርዞ ሌላ ሲያዝ
+   - "X ሰርዘህ Y ያዝልኝ" / "X ተካልኝ Y"
+
+══════════════════════════════
+💬 ጥያቄ ሲሆን — reply field ሙላ
+══════════════════════════════
+"ቁጥሮች አሉ?" → context_info ውስጥ ነፃ ቁጥሮች ብዛት ተጠቀም
+"ዋጋ ስንት?" → "ሙሉ=400ብር | ግማሽ=200ብር"
+"ሽልማት ስንት?" → "1ኛ=5000ብር 🥇 | 2ኛ=1000ብር 🥈 | 3ኛ=400ብር 🥉"
+"ሰላም/hi/hello" → ሙቅ አቀባበል + ነፃ slots ብዛት ጠቅስ
+"እንዴት?" → አጭር ማብራሪያ: ቁጥር ምረጥ → ክፈል → screenshot ላክ → ዕጣ ጠብቅ
+reply ሁልጊዜ አማርኛ ብቻ። ቢበዛ 2 ዓረፍተነገር።
 
 ══════════════════════════════
 📊 አሁናዊ ሁኔታ
@@ -814,13 +681,13 @@ hulum = ሁሉም | kefelku = ከፈልኩ | screenshot = ስክሪንሾት
 {context_info}
 
 ══════════════════════════════
-👤 ላኪ መረጃ
+👤 ላኪ
 ══════════════════════════════
 ስም: {sender_first_name}
 መልእክት: "{raw_text}"
 
 ══════════════════════════════
-📋 JSON Output — ይህን format ብቻ ተጠቀም
+📋 JSON format — ይህን ብቻ ተጠቀም
 ══════════════════════════════
 Action ሲሆን:
 {{"actions": [{{"intent": "book", "number": 21, "is_half": false, "name": null}}], "valid": true, "reply": null}}
@@ -832,21 +699,33 @@ change_type ሲሆን:
 {{"actions": [{{"intent": "change_type", "number": 21, "new_type": "half"}}], "valid": true, "reply": null}}
 
 ጥያቄ/ማብራሪያ ሲሆን:
-{{"actions": [], "valid": false, "reply": "አጭር፣ ጠቃሚ፣ ሙሉ መልስ አማርኛ — ቢበዛ 3 ዓረፍተነገር"}}
+{{"actions": [], "valid": false, "reply": "አጭር አማርኛ መልስ"}}
 
-⚠️ አስፈላጊ:
-- JSON ብቻ። ምንም backtick፣ markdown፣ ወይም ሌላ text አታክል
-- reply ሁልጊዜ አማርኛ ብቻ
-- context_info ሳትጠቀም "አላውቅም" ወይም "ልረዳህ አልቻልኩም" ፈጽሞ አትበል"""
+CRITICAL: JSON ብቻ። valid=true ሲሆን actions ባዶ መሆን የለበትም።"""
 
-    result = gemini_call(prompt, max_tokens=500, temperature=0.1)
+    result = groq_call(prompt, max_tokens=500, temperature=0.1)
     print(f"🧠 AI brain raw: {result}")
 
+    if not result:
+        # Groq ከሳተ → fallback
+        nums = extract_numbers_from_text(raw_text)
+        is_half = detect_half_booking(raw_text)
+        if nums:
+            return {
+                "actions": [{"intent": "book", "number": n, "is_half": is_half, "name": None} for n, h in nums],
+                "valid": True,
+                "reply": None
+            }
+        return {"actions": [], "valid": False, "reply": "❓ ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
+
     try:
+        # response_format json_object ስለተጠቀምን clean ማድረግ አያስፈልግም
+        # ነገር ግን safety net አለ
         clean = re.sub(r'```(?:json)?', '', result).strip().rstrip('`').strip()
         match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
-            return json.loads(match.group())
+            parsed = json.loads(match.group())
+            return parsed
     except Exception as e:
         print(f"❌ ai_brain parse error: {e}")
         increment_counter("errors")
@@ -860,6 +739,32 @@ change_type ሲሆን:
             "reply": None
         }
     return {"actions": [], "valid": False, "reply": "❓ ቁጥር ፃፍ ወይም ጥያቄ ጠይቅ።"}
+
+
+def extract_numbers_from_text(text: str) -> list:
+    matches = re.finditer(r'(?<!\d)(\d{1,3})(\+?)(?!\d)', text)
+    seen = set()
+    result = []
+    for m in matches:
+        num = int(m.group(1))
+        is_half = m.group(2) == '+'
+        if 1 <= num <= 100 and num not in seen:
+            seen.add(num)
+            result.append((num, is_half))
+    return result
+
+def detect_half_booking(raw_text: str) -> bool:
+    lower = raw_text.lower()
+    half_keywords = ["ግማሽ", "half", "begmash", "grmash", "gmash", "200"]
+    if any(k in lower for k in half_keywords):
+        return True
+    if re.search(r'\d+\s*\+', raw_text):
+        return True
+    return False
+
+def has_text(raw_text: str) -> bool:
+    cleaned = re.sub(r'[\d\s\+\&\,፣#\.\/\*\-]|ብር|birr', '', raw_text, flags=re.IGNORECASE).strip()
+    return len(cleaned) > 0
 
 # ==================== BOT HANDLERS ====================
 
@@ -1149,6 +1054,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     increment_counter("messages_handled")
 
+    # ── ADMIN: CBE SMS forward ──
     if user_id == ADMIN_TELEGRAM_ID and "Mbreciept.cbe.com.et" in raw_text:
         await handle_admin_sms(update, context, raw_text)
         return
@@ -1180,6 +1086,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         actions = [{"intent": "book", "number": n, "is_half": h, "name": None} for n, h in number_list]
 
+    # ==================== ACTIONS ====================
     booked_full   = []
     booked_half   = []
     half_joined   = []
@@ -1572,7 +1479,7 @@ def main():
 
     _bot_app = app
 
-    print(f"✅ {len(GEMINI_KEYS)} Gemini keys loaded")
+    print("✅ Groq AI Brain active — llama-3.3-70b-versatile")
     print("✅ Bot እየሰራ ነው...")
     print("✅ SMS Webhook: /sms endpoint ready")
     print("✅ /804 Resource tracking ready")
