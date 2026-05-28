@@ -52,6 +52,16 @@ def init_db():
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_screenshots (
+                    ref TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    slot_id TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    booking_type TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS lottery_state (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -182,6 +192,46 @@ def clear_pending_payment(user_id: int):
     finally:
         release_conn(conn)
 
+def save_pending_screenshot(ref: str, user_id: int, slot_id: str, amount: int, booking_type: str):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO pending_screenshots (ref, user_id, slot_id, amount, booking_type)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (ref) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    slot_id = EXCLUDED.slot_id,
+                    amount = EXCLUDED.amount,
+                    booking_type = EXCLUDED.booking_type,
+                    created_at = NOW()
+            """, (ref, user_id, slot_id, amount, booking_type))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+def get_pending_screenshot(ref: str) -> dict:
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM pending_screenshots
+                WHERE ref = %s AND created_at > NOW() - INTERVAL '24 hours'
+            """, (ref,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        release_conn(conn)
+
+def clear_pending_screenshot(ref: str):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pending_screenshots WHERE ref = %s", (ref,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
 # ==================== DATA MANAGEMENT ====================
 
 def make_empty_slot(i: int) -> dict:
@@ -197,18 +247,15 @@ def load_data() -> dict:
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # lottery_state ያነባል
             cur.execute("SELECT key, value FROM lottery_state")
             rows = {r["key"]: r["value"] for r in cur.fetchall()}
 
-            # slots
             slots_json = rows.get("slots")
             if slots_json:
                 slots = json.loads(slots_json)
             else:
                 slots = {str(i): make_empty_slot(i) for i in range(1, 21)}
 
-            # last_numbers_per_user
             cur.execute("SELECT user_id, numbers FROM user_last_numbers")
             last_numbers = {str(r["user_id"]): json.loads(r["numbers"]) for r in cur.fetchall()}
 
@@ -225,27 +272,23 @@ def save_data(data: dict):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # slots save
             cur.execute("""
                 INSERT INTO lottery_state (key, value) VALUES ('slots', %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """, (json.dumps(data["slots"], ensure_ascii=False),))
 
-            # message_id save
             if data.get("lottery_message_id"):
                 cur.execute("""
                     INSERT INTO lottery_state (key, value) VALUES ('lottery_message_id', %s)
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
                 """, (str(data["lottery_message_id"]),))
 
-            # chat_id save
             if data.get("chat_id"):
                 cur.execute("""
                     INSERT INTO lottery_state (key, value) VALUES ('chat_id', %s)
                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
                 """, (str(data["chat_id"]),))
 
-            # last_numbers_per_user save
             for uid, nums in data.get("last_numbers_per_user", {}).items():
                 cur.execute("""
                     INSERT INTO user_last_numbers (user_id, numbers) VALUES (%s, %s)
@@ -322,7 +365,6 @@ def extract_sender_from_sms(text: str) -> str:
     return match.group(1).strip() if match else None
 
 def fetch_ref_from_cbe_link(link: str) -> str:
-    """CBE link → image/page → Groq Vision → ref"""
     try:
         print(f"🔗 Fetching CBE link: {link}")
         resp = requests.get(
@@ -335,7 +377,6 @@ def fetch_ref_from_cbe_link(link: str) -> str:
         image_data = resp.content
         print(f"📄 Content-Type: {content_type}, Size: {len(image_data)} bytes")
 
-        # Groq Vision ይጠቀማል
         ref = extract_ref_with_groq(image_data, content_type.split(";")[0].strip())
         return ref
     except Exception as e:
@@ -343,7 +384,6 @@ def fetch_ref_from_cbe_link(link: str) -> str:
         return None
 
 def extract_ref_with_groq(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
-    """Groq Vision → CBE receipt ላይ ref number ያወጣል"""
     try:
         b64 = base64.b64encode(image_bytes).decode("utf-8")
         response = requests.post(
@@ -382,7 +422,6 @@ FT የሚጀምር code ነው። ምሳሌ: FT26147TDW1K
         text = result["choices"][0]["message"]["content"].strip()
         print(f"🔍 Groq extracted: {text}")
 
-        # FT... format ያወጣል
         match = re.search(r'[A-Z]{2}[A-Z0-9]{6,15}', text)
         return match.group(0) if match else None
     except Exception as e:
@@ -573,7 +612,6 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ ሎተሪ ጀምሯል!")
 
 async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin manually paid ሊያደርግ ከፈለገ"""
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
     if not context.args:
@@ -637,11 +675,10 @@ async def update_lottery_message(bot: Bot, data: dict):
 # ==================== PAYMENT: SCREENSHOT HANDLER ====================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User screenshot ሲልክ — CBE ref ያረጋግጣል"""
+    """User screenshot ሲልክ — ref ያወጣል፣ SMS ካለ ያረጋግጣል፣ ከሌለ 24ሰዓት ይጠብቃል"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # Pending payment አለ?
     pending = get_pending_payment(user_id)
     if not pending:
         await update.message.reply_text(
@@ -651,13 +688,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ ክፍያ እየተረጋገጠ ነው...")
 
-    # Photo ያወርዳል
     photos = update.message.photo
     largest = photos[-1]
     file = await context.bot.get_file(largest.file_id)
     image_bytes = await file.download_as_bytearray()
 
-    # Groq Vision → ref
     ref = extract_ref_with_groq(bytes(image_bytes), "image/jpeg")
 
     if not ref:
@@ -669,76 +704,81 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"📋 Extracted ref: {ref}")
 
-    # DB ውስጥ ይፈልጋል
-    payment = find_verified_payment(ref)
-
-    if not payment:
-        await update.message.reply_text(
-            f"❌ ይህ ክፍያ አልተረጋገጠም!\n\n"
-            f"📋 Ref: {ref}\n\n"
-            f"Admin ገና SMS አልደረሰውም። ትንሽ ቆይተው እንደገና ይሞክሩ።"
-        )
-        return
-
-    if payment["used"]:
+    # --- ref ቀድሞ ጥቅም ላይ ውሏል? ---
+    existing = find_verified_payment(ref)
+    if existing and existing.get("used"):
         await update.message.reply_text(
             f"⚠️ ይህ ክፍያ ቀድሞ ጥቅም ላይ ውሏል!\n\nRef: {ref}"
         )
         return
 
-    # Amount ይፈትሻል
-    expected_amount = pending["amount"]
-    paid_amount = payment.get("amount", 0)
+    # --- SMS ተረጋግጧል? ወዲያውኑ approve ---
+    if existing and not existing.get("used"):
+        paid_amount = existing.get("amount", 0)
+        expected_amount = pending["amount"]
 
-    if paid_amount and paid_amount < expected_amount:
+        if paid_amount and paid_amount < expected_amount:
+            await update.message.reply_text(
+                f"❌ ክፍያ አይሆንም!\n\n"
+                f"💰 የተከፈለ: ETB {paid_amount}\n"
+                f"💰 የሚፈለግ: ETB {expected_amount}\n\n"
+                f"ትክክለኛ መጠን ይክፈሉ።"
+            )
+            return
+
+        data = load_data()
+        slot_id = pending["slot_id"]
+        slot = data["slots"].get(slot_id)
+
+        if not slot:
+            await update.message.reply_text("❌ Slot አልተገኘም።")
+            return
+
+        if slot["p1_id"] == user_id:
+            data["slots"][slot_id]["p1_paid"] = True
+        elif slot["p2_id"] == user_id:
+            data["slots"][slot_id]["p2_paid"] = True
+
+        save_data(data)
+        mark_payment_used(ref, user_id)
+        clear_pending_payment(user_id)
+        clear_pending_screenshot(ref)
+
+        await update_lottery_message(context.bot, data)
+
+        sender = existing.get("sender", "Unknown")
         await update.message.reply_text(
-            f"❌ ክፍያ አይሆንም!\n\n"
-            f"💰 የተከፈለ: ETB {paid_amount}\n"
-            f"💰 የሚፈለግ: ETB {expected_amount}\n\n"
-            f"ትክክለኛ መጠን ይክፈሉ።"
+            f"✅ ክፍያ ተረጋግጧል!\n\n"
+            f"📋 Ref: {ref}\n"
+            f"💰 ETB {paid_amount}\n"
+            f"👤 {sender}\n\n"
+            f"🎰 መልካም ዕድል!"
         )
-        return
 
-    # ✅ ሁሉም ተሟልቷል — slot paid ያደርጋል
-    data = load_data()
-    slot_id = pending["slot_id"]
-    slot = data["slots"].get(slot_id)
+        data = load_data()
+        if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
+            await context.bot.send_message(chat_id, "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
 
-    if not slot:
-        await update.message.reply_text("❌ Slot አልተገኘም።")
-        return
-
-    # p1 ወይም p2 paid ያደርጋል
-    if slot["p1_id"] == user_id:
-        data["slots"][slot_id]["p1_paid"] = True
-    elif slot["p2_id"] == user_id:
-        data["slots"][slot_id]["p2_paid"] = True
-
-    save_data(data)
-    mark_payment_used(ref, user_id)
-    clear_pending_payment(user_id)
-
-    await update_lottery_message(context.bot, data)
-
-    sender = payment.get("sender", "Unknown")
-    await update.message.reply_text(
-        f"✅ ክፍያ ተረጋግጧል!\n\n"
-        f"📋 Ref: {ref}\n"
-        f"💰 ETB {paid_amount}\n"
-        f"👤 {sender}\n\n"
-        f"🎰 መልካም ዕድል!"
-    )
-
-    # ሁሉም ሞልቷል?
-    data = load_data()
-    if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
-        await context.bot.send_message(chat_id, "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
+    else:
+        # SMS ገና አልደረሰም — pending_screenshots ይቀምጣል
+        save_pending_screenshot(
+            ref,
+            user_id,
+            pending["slot_id"],
+            pending["amount"],
+            pending["booking_type"]
+        )
+        await update.message.reply_text(
+            f"⏳ Screenshot ተቀብሏል!\n\n"
+            f"📋 Ref: {ref}\n\n"
+            f"Admin SMS ሲደርስ ክፍያዎ ይረጋገጣል።\n"
+            f"እንደገና screenshot መላክ አያስፈልግም። ✅"
+        )
 
 # ==================== PAYMENT: ADMIN SMS HANDLER ====================
 
 async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """Admin CBE SMS forward ሲልክ"""
-    chat_id = update.effective_chat.id
     await update.message.reply_text("⏳ CBE receipt እየተረጋገጠ ነው...")
 
     link = extract_cbe_link(text)
@@ -763,6 +803,59 @@ async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     if not already:
         await update.message.reply_text(f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!\nRef: {ref}")
         return
+
+    # --- pending screenshot አለ? auto-approve ---
+    pending_sc = get_pending_screenshot(ref)
+    if pending_sc:
+        try:
+            data = load_data()
+            slot_id = pending_sc["slot_id"]
+            slot = data["slots"].get(slot_id)
+            sc_user_id = pending_sc["user_id"]
+            expected_amount = pending_sc["amount"]
+
+            if slot and (not amount or amount >= expected_amount):
+                if slot.get("p1_id") == sc_user_id:
+                    data["slots"][slot_id]["p1_paid"] = True
+                elif slot.get("p2_id") == sc_user_id:
+                    data["slots"][slot_id]["p2_paid"] = True
+
+                save_data(data)
+                mark_payment_used(ref, sc_user_id)
+                clear_pending_payment(sc_user_id)
+                clear_pending_screenshot(ref)
+
+                await update_lottery_message(context.bot, data)
+
+                # user ይነግራቸዋል
+                await context.bot.send_message(
+                    chat_id=sc_user_id,
+                    text=(
+                        f"✅ ክፍያዎ ተረጋግጧል!\n\n"
+                        f"📋 Ref: {ref}\n"
+                        f"💰 ETB {amount}\n"
+                        f"👤 {sender or 'Unknown'}\n\n"
+                        f"🎰 መልካም ዕድል!"
+                    )
+                )
+
+                await update.message.reply_text(
+                    f"✅ Payment ተመዝግቦ auto-approved!\n\n"
+                    f"📋 Ref: {ref}\n"
+                    f"💰 Amount: ETB {amount}\n"
+                    f"👤 Sender: {sender or 'Unknown'}\n"
+                    f"🤖 Screenshot ቀደም ተልኮ ነበር — ተረጋግጧል!"
+                )
+
+                data = load_data()
+                if sum(1 for s in data["slots"].values() if is_slot_full_booked(s)) == 20:
+                    chat_id = data.get("chat_id")
+                    if chat_id:
+                        await context.bot.send_message(chat_id, "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
+                return
+
+        except Exception as e:
+            print(f"❌ Auto-approve error: {e}")
 
     await update.message.reply_text(
         f"✅ Payment ተመዝግቧል!\n\n"
@@ -823,7 +916,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     not_yours     = []
     changed       = False
 
-    # ── ለ pending payment slot_id ──
     last_booked_slot_id = None
     last_booked_amount  = 0
     last_booked_type    = "full"
@@ -1053,7 +1145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== FLASK SMS WEBHOOK ====================
 
 flask_app = Flask(__name__)
-_bot_app = None  # telegram app reference
+_bot_app = None
 
 @flask_app.route("/", methods=["GET"])
 def health():
@@ -1061,7 +1153,6 @@ def health():
 
 @flask_app.route("/sms", methods=["POST"])
 def sms_webhook():
-    """SMS Forwarder app → ይህ endpoint ይልካል"""
     try:
         if flask_request.is_json:
             payload = flask_request.get_json()
@@ -1108,23 +1199,67 @@ def _process_cbe_sms(sms_text: str):
 
     saved = save_verified_payment(ref, amount or 0, sender or "Unknown")
 
+    # --- pending screenshot አለ? auto-approve ---
+    pending_sc = get_pending_screenshot(ref)
+    auto_approved = False
+
+    if pending_sc:
+        try:
+            data = load_data()
+            slot_id = pending_sc["slot_id"]
+            slot = data["slots"].get(slot_id)
+            sc_user_id = pending_sc["user_id"]
+            expected_amount = pending_sc["amount"]
+
+            if slot and (not amount or amount >= expected_amount):
+                if slot.get("p1_id") == sc_user_id:
+                    data["slots"][slot_id]["p1_paid"] = True
+                elif slot.get("p2_id") == sc_user_id:
+                    data["slots"][slot_id]["p2_paid"] = True
+
+                save_data(data)
+                mark_payment_used(ref, sc_user_id)
+                clear_pending_payment(sc_user_id)
+                clear_pending_screenshot(ref)
+                auto_approved = True
+                print(f"✅ Auto-approved ref={ref} for user_id={sc_user_id}")
+        except Exception as e:
+            print(f"❌ Auto-approve error: {e}")
+
     if _bot_app and ADMIN_TELEGRAM_ID:
         async def notify():
-            if saved:
-                msg = (
-                    f"✅ አዲስ ክፍያ ተመዝግቧል!
-
-"
-                    f"📋 Ref: {ref}
-"
-                    f"💰 Amount: ETB {amount}
-"
+            if auto_approved:
+                admin_msg = (
+                    f"✅ ክፍያ auto-approved!\n\n"
+                    f"📋 Ref: {ref}\n"
+                    f"💰 Amount: ETB {amount}\n"
+                    f"👤 Sender: {sender or 'Unknown'}\n"
+                    f"🤖 Screenshot ቀደም ተልኮ ነበር — ተረጋግጧል!"
+                )
+            elif saved:
+                admin_msg = (
+                    f"✅ አዲስ ክፍያ ተመዝግቧል!\n\n"
+                    f"📋 Ref: {ref}\n"
+                    f"💰 Amount: ETB {amount}\n"
                     f"👤 Sender: {sender or 'Unknown'}"
                 )
             else:
-                msg = f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!
-Ref: {ref}"
-            await _bot_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=msg)
+                admin_msg = f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!\nRef: {ref}"
+
+            await _bot_app.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=admin_msg)
+
+            if auto_approved and pending_sc:
+                user_msg = (
+                    f"✅ ክፍያዎ ተረጋግጧል!\n\n"
+                    f"📋 Ref: {ref}\n"
+                    f"💰 ETB {amount}\n"
+                    f"👤 {sender or 'Unknown'}\n\n"
+                    f"🎰 መልካም ዕድል!"
+                )
+                await _bot_app.bot.send_message(
+                    chat_id=pending_sc["user_id"],
+                    text=user_msg
+                )
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1139,9 +1274,8 @@ def run_flask():
 
 def main():
     global _bot_app
-    init_db()  # ← PostgreSQL tables ይፈጥራል
+    init_db()
 
-    # Flask SMS webhook — background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
@@ -1164,11 +1298,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    _bot_app = app  # SMS webhook notification ለማስቻል
+    _bot_app = app
 
     print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded")
     print("✅ Bot እየሰራ ነው...")
-    print(f"✅ SMS Webhook: /sms endpoint ready")
+    print("✅ SMS Webhook: /sms endpoint ready")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
