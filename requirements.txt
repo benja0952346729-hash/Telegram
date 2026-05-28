@@ -1,4 +1,5 @@
 python-telegram-bot
+groq
 google-genai==1.16.0
 requests
 psycopg2-binary
