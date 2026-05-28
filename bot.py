@@ -4,9 +4,11 @@ import json
 import base64
 import threading
 import requests
+import psutil
 import psycopg2
 import psycopg2.extras
 from psycopg2 import pool
+from datetime import datetime
 from flask import Flask, request as flask_request, jsonify
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -73,31 +75,147 @@ def init_db():
                     numbers TEXT NOT NULL
                 )
             """)
+            # ── Resource tracking table ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS resource_usage (
+                    id SERIAL PRIMARY KEY,
+                    day DATE NOT NULL DEFAULT CURRENT_DATE,
+                    gemini_calls INTEGER DEFAULT 0,
+                    groq_calls INTEGER DEFAULT 0,
+                    db_queries INTEGER DEFAULT 0,
+                    messages_handled INTEGER DEFAULT 0,
+                    photos_handled INTEGER DEFAULT 0,
+                    sms_received INTEGER DEFAULT 0,
+                    auto_approved INTEGER DEFAULT 0,
+                    errors INTEGER DEFAULT 0,
+                    UNIQUE(day)
+                )
+            """)
         conn.commit()
         print("✅ Database tables ready")
     finally:
         release_conn(conn)
 
-ADDIS_AI_KEYS = [
-    os.getenv("ADDIS_AI_API_KEY_1"),
-    os.getenv("ADDIS_AI_API_KEY_2"),
-    os.getenv("ADDIS_AI_API_KEY_3"),
-    os.getenv("ADDIS_AI_API_KEY_4"),
-    os.getenv("ADDIS_AI_API_KEY_5"),
-    os.getenv("ADDIS_AI_API_KEY_6"),
-    os.getenv("ADDIS_AI_API_KEY_7"),
-    os.getenv("ADDIS_AI_API_KEY_8"),
-    os.getenv("ADDIS_AI_API_KEY_9"),
-    os.getenv("ADDIS_AI_API_KEY_10"),
-]
-ADDIS_AI_KEYS = [k for k in ADDIS_AI_KEYS if k]
-current_key_index = 0
+# ==================== RESOURCE TRACKING ====================
 
-def get_next_key() -> str:
-    global current_key_index
-    key = ADDIS_AI_KEYS[current_key_index % len(ADDIS_AI_KEYS)]
-    current_key_index += 1
-    return key
+def increment_counter(column: str, amount: int = 1):
+    """አንድ counter ይጨምራል — background thread safe"""
+    def _inc():
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    INSERT INTO resource_usage (day, {column})
+                    VALUES (CURRENT_DATE, %s)
+                    ON CONFLICT (day) DO UPDATE
+                    SET {column} = resource_usage.{column} + %s
+                """, (amount, amount))
+            conn.commit()
+        except Exception as e:
+            print(f"❌ Counter error ({column}): {e}")
+        finally:
+            release_conn(conn)
+    threading.Thread(target=_inc, daemon=True).start()
+
+def get_usage_last_5_days() -> list:
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 
+                    day, gemini_calls, groq_calls, db_queries,
+                    messages_handled, photos_handled,
+                    sms_received, auto_approved, errors
+                FROM resource_usage
+                ORDER BY day DESC
+                LIMIT 5
+            """)
+            return cur.fetchall()
+    finally:
+        release_conn(conn)
+
+def get_system_metrics() -> dict:
+    try:
+        process = psutil.Process(os.getpid())
+        ram_mb = process.memory_info().rss / 1024 / 1024
+        cpu_pct = process.cpu_percent(interval=0.1)
+        sys_ram = psutil.virtual_memory()
+        return {
+            "bot_ram_mb": round(ram_mb, 1),
+            "bot_cpu_pct": round(cpu_pct, 1),
+            "sys_ram_pct": round(sys_ram.percent, 1),
+            "sys_ram_used": round(sys_ram.used / 1024 / 1024, 1),
+            "sys_ram_total": round(sys_ram.total / 1024 / 1024, 1),
+        }
+    except Exception as e:
+        print(f"❌ Metrics error: {e}")
+        return {}
+
+def build_progress_bar(percent: float, width: int = 10) -> str:
+    filled = round((percent / 100) * width)
+    bar = "█" * filled + "░" * (width - filled)
+    emoji = "🟢" if percent < 60 else "🟡" if percent < 85 else "🔴"
+    return f"{emoji} [{bar}] {percent}%"
+
+def build_804_report() -> str:
+    rows = get_usage_last_5_days()
+    metrics = get_system_metrics()
+    gemini_daily_limit = len([k for k in GEMINI_KEYS if k]) * 1000
+
+    lines = ["📊 *Bot Resource Report*", ""]
+
+    # ── System ──
+    if metrics:
+        lines.append("🖥 *System — አሁን*")
+        lines.append(f"  Bot RAM:  `{metrics.get('bot_ram_mb')} MB`")
+        lines.append(f"  Bot CPU:  `{metrics.get('bot_cpu_pct')}%`")
+        lines.append(f"  Sys RAM:  `{metrics.get('sys_ram_used')} / {metrics.get('sys_ram_total')} MB ({metrics.get('sys_ram_pct')}%)`")
+        lines.append("")
+
+    # ── Gemini today ──
+    if rows:
+        today = rows[0]
+        gemini_today = today[1] or 0
+        groq_today = today[2] or 0
+        gemini_pct = round((gemini_today / gemini_daily_limit) * 100, 1) if gemini_daily_limit > 0 else 0
+
+        lines.append("🤖 *Gemini API — ዛሬ*")
+        lines.append(f"  ጥቅም: `{gemini_today} / {gemini_daily_limit}`")
+        lines.append(f"  {build_progress_bar(gemini_pct)}")
+        lines.append("")
+
+        lines.append("⚡ *Groq API — ዛሬ*")
+        lines.append(f"  ጥቅም: `{groq_today}` calls")
+        lines.append("")
+
+    # ── 5 ቀን table ──
+    lines.append("📅 *የ 5 ቀን Usage*")
+    lines.append("```")
+    lines.append(f"{'ቀን':<10} {'Gem':>5} {'Groq':>5} {'Msg':>5} {'📷':>4} {'SMS':>4} {'✅':>4} {'❌':>4}")
+    lines.append("─" * 46)
+
+    for row in rows:
+        day, gemini, groq, db_q, msgs, photos, sms, auto_app, errors = row
+        day_str = day.strftime("%m/%d") if hasattr(day, "strftime") else str(day)
+        lines.append(
+            f"{day_str:<10} {gemini or 0:>5} {groq or 0:>5} "
+            f"{msgs or 0:>5} {photos or 0:>4} {sms or 0:>4} "
+            f"{auto_app or 0:>4} {errors or 0:>4}"
+        )
+
+    if not rows:
+        lines.append("  (ምንም data የለም ገና)")
+
+    lines.append("```")
+    lines.append("")
+
+    # ── Legend ──
+    lines.append("_Gem=Gemini | Groq=Groq | Msg=Messages_")
+    lines.append("_📷=Photos | SMS=SMS | ✅=AutoApproved | ❌=Errors_")
+    lines.append("")
+    lines.append(f"_🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}_")
+
+    return "\n".join(lines)
 
 # ==================== LOTTERY TEMPLATE ====================
 LOTTERY_TEMPLATE = """በ 400 ብር 5 ቁጥሮችን በተከታታይ በመያዝ እድሎን ይሞክሩ ለ 20 ሰው ብቻ ፈጣን ዕድል መልካም ዕድል
@@ -129,6 +247,7 @@ def save_verified_payment(ref: str, amount: float, sender: str) -> bool:
             """, (ref, amount, sender))
             inserted = cur.rowcount > 0
         conn.commit()
+        increment_counter("db_queries")
         if inserted:
             print(f"✅ Payment saved: ref={ref}, amount={amount}")
         return inserted
@@ -141,6 +260,7 @@ def find_verified_payment(ref: str) -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM payments WHERE ref = %s", (ref,))
             row = cur.fetchone()
+            increment_counter("db_queries")
             return dict(row) if row else None
     finally:
         release_conn(conn)
@@ -153,6 +273,7 @@ def mark_payment_used(ref: str, user_id: int):
                 UPDATE payments SET used = TRUE, used_by = %s WHERE ref = %s
             """, (user_id, ref))
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -170,6 +291,7 @@ def save_pending_payment(user_id: int, slot_id: str, amount: int, booking_type: 
                     created_at = NOW()
             """, (user_id, slot_id, amount, booking_type))
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -179,6 +301,7 @@ def get_pending_payment(user_id: int) -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM pending_payments WHERE user_id = %s", (user_id,))
             row = cur.fetchone()
+            increment_counter("db_queries")
             return dict(row) if row else None
     finally:
         release_conn(conn)
@@ -189,6 +312,7 @@ def clear_pending_payment(user_id: int):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM pending_payments WHERE user_id = %s", (user_id,))
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -207,6 +331,7 @@ def save_pending_screenshot(ref: str, user_id: int, slot_id: str, amount: int, b
                     created_at = NOW()
             """, (ref, user_id, slot_id, amount, booking_type))
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -219,6 +344,7 @@ def get_pending_screenshot(ref: str) -> dict:
                 WHERE ref = %s AND created_at > NOW() - INTERVAL '24 hours'
             """, (ref,))
             row = cur.fetchone()
+            increment_counter("db_queries")
             return dict(row) if row else None
     finally:
         release_conn(conn)
@@ -229,6 +355,7 @@ def clear_pending_screenshot(ref: str):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM pending_screenshots WHERE ref = %s", (ref,))
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -259,6 +386,7 @@ def load_data() -> dict:
             cur.execute("SELECT user_id, numbers FROM user_last_numbers")
             last_numbers = {str(r["user_id"]): json.loads(r["numbers"]) for r in cur.fetchall()}
 
+            increment_counter("db_queries")
             return {
                 "slots": slots,
                 "lottery_message_id": int(rows["lottery_message_id"]) if rows.get("lottery_message_id") else None,
@@ -296,6 +424,7 @@ def save_data(data: dict):
                 """, (int(uid), json.dumps(nums)))
 
         conn.commit()
+        increment_counter("db_queries")
     finally:
         release_conn(conn)
 
@@ -381,6 +510,7 @@ def fetch_ref_from_cbe_link(link: str) -> str:
         return ref
     except Exception as e:
         print(f"❌ CBE link fetch error: {e}")
+        increment_counter("errors")
         return None
 
 def extract_ref_with_groq(image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
@@ -422,33 +552,73 @@ FT የሚጀምር code ነው። ምሳሌ: FT26147TDW1K
         text = result["choices"][0]["message"]["content"].strip()
         print(f"🔍 Groq extracted: {text}")
 
+        # ✅ Count Groq call
+        increment_counter("groq_calls")
+
         match = re.search(r'[A-Z]{2}[A-Z0-9]{6,15}', text)
         return match.group(0) if match else None
     except Exception as e:
         print(f"❌ Groq Vision error: {e}")
+        increment_counter("errors")
         return None
 
-# ==================== ADDIS AI HELPERS ====================
+# ==================== GEMINI AI HELPERS ====================
 
-def addis_call(prompt: str, max_tokens: int = 300, temperature: float = 0.3) -> str:
-    try:
-        response = requests.post(
-            "https://api.addisassistant.com/api/v1/chat_generate",
-            headers={"x-api-key": get_next_key(), "Content-Type": "application/json"},
-            json={
-                "model": "Addis-፩-አሌፍ",
-                "prompt": prompt,
-                "target_language": "am",
-                "generation_config": {"temperature": temperature, "maxOutputTokens": max_tokens}
-            },
-            timeout=20
-        )
-        data = response.json()
-        inner = data.get("data", data)
-        return inner.get("response_text", "").strip()
-    except Exception as e:
-        print(f"❌ Addis AI call error: {e}")
-        return ""
+GEMINI_KEYS = [
+    os.getenv("GEMINI_API_KEY_1"),
+    os.getenv("GEMINI_API_KEY_2"),
+    os.getenv("GEMINI_API_KEY_3"),
+    os.getenv("GEMINI_API_KEY_4"),
+    os.getenv("GEMINI_API_KEY_5"),
+    os.getenv("GEMINI_API_KEY_6"),
+    os.getenv("GEMINI_API_KEY_7"),
+    os.getenv("GEMINI_API_KEY_8"),
+]
+GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+gemini_key_index = 0
+
+def get_next_gemini_key() -> str:
+    global gemini_key_index
+    key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
+    gemini_key_index += 1
+    return key
+
+def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) -> str:
+    last_error = None
+    for attempt in range(len(GEMINI_KEYS)):
+        key = get_next_gemini_key()
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens
+                    }
+                },
+                timeout=20
+            )
+            if response.status_code == 429:
+                print(f"⚠️ Gemini key {attempt+1} rate limited, trying next...")
+                last_error = "429"
+                continue
+            data = response.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            print(f"✅ Gemini response (key {attempt+1}): {text[:80]}")
+
+            # ✅ Count Gemini call
+            increment_counter("gemini_calls")
+
+            return text
+        except Exception as e:
+            print(f"❌ Gemini call error (key {attempt+1}): {e}")
+            last_error = str(e)
+            increment_counter("errors")
+            continue
+    print(f"❌ All Gemini keys failed: {last_error}")
+    return ""
 
 def extract_numbers_from_text(text: str) -> list:
     matches = re.finditer(r'(?<!\d)(\d{1,3})(\+?)(?!\d)', text)
@@ -566,14 +736,6 @@ JSON ብቻ መልስ። ምንም ሌላ ቃል፣ ማብራሪያ፣ ወይም
 ጥያቄ ሲመጣ context_info ተጠቅምህ ትክክለኛ፣ አጭር፣ ጠቃሚ መልስ ስጥ።
 reply አማርኛ ብቻ፣ 1-2 ዓረፍተነገር።
 
-ምሳሌ ጥያቄዎችና ትክክለኛ መልሶቻቸው፦
-"አጠቃላይ ስንት ብር ነው?" → context ውስጥ ስንት slots እንዳዘዙ ተቆጥሮ "Xብር" ቀጥታ መልስ
-"ስንት ቀርቷል?" → "X slots ቀርቷል" ቀጥታ
-"X ቁጥር አለ?" → "አለ ✅" ወይም "የለም፣ ተያዟል ❌" ቀጥታ
-"ሰላም" → "ሰላም {sender_first_name}! ቁጥር ይያዙ 🎰"
-"ምን ያህል ሰው ነው?" → "20 ሰው ብቻ ነው"
-"እንዴት ነው?" → አጭር ሰላምታ ብቻ
-
 ══════════════════════════════
 📊 አሁናዊ ሁኔታ (context)
 ══════════════════════════════
@@ -602,7 +764,7 @@ change_type ሲሆን:
 
 JSON ብቻ። ምንም ሌላ ቃል አታክል።"""
 
-    result = addis_call(prompt, max_tokens=300, temperature=0.1)
+    result = gemini_call(prompt, max_tokens=500, temperature=0.1)
     print(f"🧠 AI brain raw: {result}")
 
     try:
@@ -611,6 +773,7 @@ JSON ብቻ። ምንም ሌላ ቃል አታክል።"""
             return json.loads(match.group())
     except Exception as e:
         print(f"❌ ai_brain parse error: {e}")
+        increment_counter("errors")
 
     nums = extract_numbers_from_text(raw_text)
     is_half = detect_half_booking(raw_text)
@@ -678,6 +841,24 @@ async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_lottery_message(context.bot, data)
     await update.message.reply_text(f"✅ {name} ክፍያ ተረጋግጧል!")
 
+# ==================== /804 ADMIN REPORT ====================
+
+async def admin_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin /804 ሲል resource report ይላካል"""
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
+        return
+
+    await update.message.reply_text("⏳ Report እየተሰራ ነው...")
+
+    try:
+        report = build_804_report()
+        await update.message.reply_text(report, parse_mode="Markdown")
+    except Exception as e:
+        print(f"❌ /804 report error: {e}")
+        increment_counter("errors")
+        await update.message.reply_text(f"❌ Report ሲሰራ ስህተት: {e}")
+
 async def update_lottery_message(bot: Bot, data: dict):
     msg_id = data.get("lottery_message_id")
     chat_id = data.get("chat_id")
@@ -690,25 +871,27 @@ async def update_lottery_message(bot: Bot, data: dict):
             )
         except Exception as e:
             print(f"❌ Message update error: {e}")
+            increment_counter("errors")
             try:
                 sent = await bot.send_message(chat_id=chat_id, text=build_full_message(data))
                 data["lottery_message_id"] = sent.message_id
                 save_data(data)
             except Exception as e2:
                 print(f"❌ Send new message error: {e2}")
+                increment_counter("errors")
 
 # ==================== PAYMENT: SCREENSHOT HANDLER ====================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User screenshot ሲልክ — ref ያወጣል፣ SMS ካለ ያረጋግጣል፣ ከሌለ 24ሰዓት ይጠብቃል"""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
+    # ✅ Count photo
+    increment_counter("photos_handled")
+
     pending = get_pending_payment(user_id)
     if not pending:
-        await update.message.reply_text(
-            "❓ መጀመሪያ ቁጥር ይያዙ፣ ከዚያ screenshot ይላኩ።"
-        )
+        await update.message.reply_text("❓ መጀመሪያ ቁጥር ይያዙ፣ ከዚያ screenshot ይላኩ።")
         return
 
     await update.message.reply_text("⏳ ክፍያ እየተረጋገጠ ነው...")
@@ -721,6 +904,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ref = extract_ref_with_groq(bytes(image_bytes), "image/jpeg")
 
     if not ref:
+        increment_counter("errors")
         await update.message.reply_text(
             "❌ Reference number ማንበብ አልተቻለም።\n"
             "CBE receipt screenshot ትክክለኛ መሆኑን ያረጋግጡ።"
@@ -729,15 +913,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     print(f"📋 Extracted ref: {ref}")
 
-    # --- ref ቀድሞ ጥቅም ላይ ውሏል? ---
     existing = find_verified_payment(ref)
     if existing and existing.get("used"):
-        await update.message.reply_text(
-            f"⚠️ ይህ ክፍያ ቀድሞ ጥቅም ላይ ውሏል!\n\nRef: {ref}"
-        )
+        await update.message.reply_text(f"⚠️ ይህ ክፍያ ቀድሞ ጥቅም ላይ ውሏል!\n\nRef: {ref}")
         return
 
-    # --- SMS ተረጋግጧል? ወዲያውኑ approve ---
     if existing and not existing.get("used"):
         paid_amount = existing.get("amount", 0)
         expected_amount = pending["amount"]
@@ -768,6 +948,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_payment_used(ref, user_id)
         clear_pending_payment(user_id)
         clear_pending_screenshot(ref)
+        increment_counter("auto_approved")
 
         await update_lottery_message(context.bot, data)
 
@@ -785,14 +966,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, "🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
 
     else:
-        # SMS ገና አልደረሰም — pending_screenshots ይቀምጣል
-        save_pending_screenshot(
-            ref,
-            user_id,
-            pending["slot_id"],
-            pending["amount"],
-            pending["booking_type"]
-        )
+        save_pending_screenshot(ref, user_id, pending["slot_id"], pending["amount"], pending["booking_type"])
         await update.message.reply_text(
             f"⏳ Screenshot ተቀብሏል!\n\n"
             f"📋 Ref: {ref}\n\n"
@@ -803,7 +977,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== PAYMENT: ADMIN SMS HANDLER ====================
 
 async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Admin CBE SMS forward ሲልክ"""
+    # ✅ Count SMS
+    increment_counter("sms_received")
+
     await update.message.reply_text("⏳ CBE receipt እየተረጋገጠ ነው...")
 
     link = extract_cbe_link(text)
@@ -829,7 +1005,6 @@ async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await update.message.reply_text(f"⚠️ ይህ payment ቀድሞ ተመዝግቧል!\nRef: {ref}")
         return
 
-    # --- pending screenshot አለ? auto-approve ---
     pending_sc = get_pending_screenshot(ref)
     if pending_sc:
         try:
@@ -849,10 +1024,10 @@ async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 mark_payment_used(ref, sc_user_id)
                 clear_pending_payment(sc_user_id)
                 clear_pending_screenshot(ref)
+                increment_counter("auto_approved")
 
                 await update_lottery_message(context.bot, data)
 
-                # user ይነግራቸዋል
                 await context.bot.send_message(
                     chat_id=sc_user_id,
                     text=(
@@ -881,6 +1056,7 @@ async def handle_admin_sms(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
         except Exception as e:
             print(f"❌ Auto-approve error: {e}")
+            increment_counter("errors")
 
     await update.message.reply_text(
         f"✅ Payment ተመዝግቧል!\n\n"
@@ -899,6 +1075,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_first_name = update.effective_user.first_name or "ተጠቃሚ"
     user_id = update.effective_user.id
     data = load_data()
+
+    # ✅ Count message
+    increment_counter("messages_handled")
 
     # ── ADMIN: CBE SMS forward ──
     if user_id == ADMIN_TELEGRAM_ID and "Mbreciept.cbe.com.et" in raw_text:
@@ -959,7 +1138,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if slot is None:
             continue
 
-        # ── BOOK ──
         if intent == "book":
             if is_half:
                 if slot["type"] is None:
@@ -1012,7 +1190,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     already_taken.append(number)
 
-        # ── CANCEL ──
         elif intent == "cancel":
             if slot["type"] is None:
                 not_yours.append(number)
@@ -1038,7 +1215,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 not_yours.append(number)
 
-        # ── CHANGE TYPE ──
         elif intent == "change_type":
             new_type = action.get("new_type", "half")
             if slot["type"] is None:
@@ -1068,7 +1244,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     last_booked_type    = "full"
                 changed = True
 
-        # ── SWAP ──
         elif intent == "swap":
             cancel_number = action.get("cancel_number")
             book_numbers  = action.get("book_numbers", [])
@@ -1138,7 +1313,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(data)
         await update_lottery_message(context.bot, data)
 
-    # ── REPLIES ──
     if booked_full:
         await update.message.reply_text(f"እሺ ገቢ {len(booked_full) * 400}ብር 🙏")
         if last_booked_slot_id:
@@ -1203,11 +1377,13 @@ def sms_webhook():
 
     except Exception as e:
         print(f"❌ SMS webhook error: {e}")
+        increment_counter("errors")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 def _process_cbe_sms(sms_text: str):
-    """Background thread — CBE SMS ያስተናግዳል"""
     import asyncio
+
+    increment_counter("sms_received")
 
     link = extract_cbe_link(sms_text)
     amount = extract_amount_from_sms(sms_text)
@@ -1220,11 +1396,11 @@ def _process_cbe_sms(sms_text: str):
     ref = fetch_ref_from_cbe_link(link)
     if not ref:
         print("❌ Could not extract ref from CBE link")
+        increment_counter("errors")
         return
 
     saved = save_verified_payment(ref, amount or 0, sender or "Unknown")
 
-    # --- pending screenshot አለ? auto-approve ---
     pending_sc = get_pending_screenshot(ref)
     auto_approved = False
 
@@ -1247,9 +1423,11 @@ def _process_cbe_sms(sms_text: str):
                 clear_pending_payment(sc_user_id)
                 clear_pending_screenshot(ref)
                 auto_approved = True
+                increment_counter("auto_approved")
                 print(f"✅ Auto-approved ref={ref} for user_id={sc_user_id}")
         except Exception as e:
             print(f"❌ Auto-approve error: {e}")
+            increment_counter("errors")
 
     if _bot_app and ADMIN_TELEGRAM_ID:
         async def notify():
@@ -1320,14 +1498,16 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start_lottery", start_lottery))
     app.add_handler(CommandHandler("paid", mark_paid))
+    app.add_handler(CommandHandler("804", admin_report))        # ✅ /804 command
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     _bot_app = app
 
-    print(f"✅ {len(ADDIS_AI_KEYS)} Addis AI keys loaded")
+    print(f"✅ {len(GEMINI_KEYS)} Gemini keys loaded")
     print("✅ Bot እየሰራ ነው...")
     print("✅ SMS Webhook: /sms endpoint ready")
+    print("✅ /804 Resource tracking ready")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
