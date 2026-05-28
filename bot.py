@@ -608,9 +608,13 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) ->
                 print(f"📡 Status: {response.status_code} | Model: {model} | Key: {attempt+1}")
 
                 if response.status_code == 429:
-                    print(f"⚠️ 429 Rate limited — {model} key {attempt+1}")
+                    body = response.text[:300]
+                    print(f"⚠️ 429 Rate limited — {model} key {attempt+1}: {body}")
                     last_error = "429"
-                    time.sleep(0.3)
+                    # ── ተራ በተራ ለመግባት delay ──
+                    wait = 2 + attempt * 1  # key 1→2s, key 2→3s, key 3→4s ...
+                    print(f"⏳ Waiting {wait}s before next key...")
+                    time.sleep(wait)
                     continue
 
                 if response.status_code == 400:
@@ -633,7 +637,6 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.1) ->
 
                 data = response.json()
 
-                # candidates ባዶ ከሆነ
                 if not data.get("candidates"):
                     print(f"⚠️ Empty candidates — {model} key {attempt+1}: {data}")
                     last_error = "empty candidates"
@@ -717,7 +720,7 @@ def build_context_info(data: dict) -> str:
         lines.append("\n✅ ሁሉም slots ተሞልቷል!")
     return "\n".join(lines)
 
-# ==================== AI BRAIN (IMPROVED PROMPT) ====================
+# ==================== AI BRAIN ====================
 
 def ai_brain(raw_text: str, sender_first_name: str, context_info: str,
              last_numbers: list = None, free_numbers: list = None) -> dict:
@@ -840,7 +843,6 @@ change_type ሲሆን:
     print(f"🧠 AI brain raw: {result}")
 
     try:
-        # JSON ከ markdown backtick ካለ አስወግድ
         clean = re.sub(r'```(?:json)?', '', result).strip().rstrip('`').strip()
         match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
@@ -1147,7 +1149,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     increment_counter("messages_handled")
 
-    # ── ADMIN: CBE SMS forward ──
     if user_id == ADMIN_TELEGRAM_ID and "Mbreciept.cbe.com.et" in raw_text:
         await handle_admin_sms(update, context, raw_text)
         return
@@ -1179,7 +1180,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         actions = [{"intent": "book", "number": n, "is_half": h, "name": None} for n, h in number_list]
 
-    # ==================== ACTIONS ====================
     booked_full   = []
     booked_half   = []
     half_joined   = []
