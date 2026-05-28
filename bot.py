@@ -249,7 +249,6 @@ def get_slot_by_number(number: int, data: dict):
     return None, None
 
 def get_slot_by_user(user_id: int, data: dict):
-    """User የያዘው slot ያምጣ"""
     results = []
     for slot_id, slot in data["slots"].items():
         if slot["p1_id"] == user_id or slot["p2_id"] == user_id:
@@ -349,7 +348,6 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) ->
 # ==================== GROQ PAYMENT EXTRACTION ====================
 
 def groq_extract_payment_from_text(text: str) -> dict:
-    """SMS ወይም text ከ payment info ያወጣ — ሁለት ref ሊኖር ይችላል"""
     try:
         client = Groq(api_key=GROQ_API_KEY)
         prompt = f"""Extract ALL transaction reference IDs from this SMS/text. Return JSON only, no markdown.
@@ -377,7 +375,6 @@ JSON only:"""
         raw   = response.choices[0].message.content.strip()
         clean = re.sub(r'```(?:json)?', '', raw).strip()
         result = json.loads(clean)
-        # backward compat — single ref ካለ list አድርገው
         if "ref" in result and "refs" not in result:
             result["refs"] = [result["ref"]] if result.get("ref") else []
         return result
@@ -387,7 +384,6 @@ JSON only:"""
 
 
 def groq_extract_payment_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-    """Screenshot ከ payment info ያወጣ (Groq vision)"""
     try:
         client    = Groq(api_key=GROQ_API_KEY)
         b64_image = base64.b64encode(image_bytes).decode("utf-8")
@@ -425,22 +421,18 @@ JSON only:"""
 # ==================== PAYMENT APPROVAL LOGIC ====================
 
 async def handle_payment_match(ref: str, payment: dict, bot: Bot, data: dict):
-    """Photo + SMS ሁለቱም ሲሟሉ auto approve"""
     user_id  = payment["user_id"]
     amount   = payment["amount"]
     bank     = payment["bank"]
     slot_num = payment["slot_number"]
 
-    # ref ተጠቅሟል?
     if is_ref_used(ref):
         await bot.send_message(chat_id=user_id, text=f"❌ ይህ ref ({ref}) አስቀድሞ ተጠቅሟል!")
         return
 
-    # slot ያምጣ
     if slot_num:
         slot_id, slot = get_slot_by_number(slot_num, data)
     else:
-        # user የያዘው slot ያምጣ
         user_slots = get_slot_by_user(user_id, data)
         if not user_slots:
             await bot.send_message(chat_id=user_id, text="❌ ያዝከው slot አልተገኘም።")
@@ -448,7 +440,6 @@ async def handle_payment_match(ref: str, payment: dict, bot: Bot, data: dict):
         slot_id, slot = user_slots[0]
         slot_num = slot["numbers"][0]
 
-    # ብር ትክክል ነው?
     expected = 400.0 if slot["type"] == "full" else 200.0
     if amount < expected:
         await bot.send_message(
@@ -457,7 +448,6 @@ async def handle_payment_match(ref: str, payment: dict, bot: Bot, data: dict):
         )
         return
 
-    # Approve!
     if slot["p1_id"] == user_id:
         data["slots"][slot_id]["p1_paid"] = True
     elif slot["p2_id"] == user_id:
@@ -826,7 +816,6 @@ async def update_lottery_message(bot: Bot, data: dict):
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User screenshot ሲልክ"""
     if not update.message or not update.message.photo:
         return
 
@@ -836,8 +825,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Screenshot እየተመረመረ ነው...")
 
     try:
-        photo   = update.message.photo[-1]
-        file    = await context.bot.get_file(photo.file_id)
+        photo     = update.message.photo[-1]
+        file      = await context.bot.get_file(photo.file_id)
         img_bytes = await file.download_as_bytearray()
 
         info = groq_extract_payment_from_image(bytes(img_bytes))
@@ -855,7 +844,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ ይህ ref ({ref}) አስቀድሞ ተጠቅሟል!")
             return
 
-        # User slot ያምጣ
         data       = load_data()
         user_slots = get_slot_by_user(user_id, data)
         slot_num   = user_slots[0][1]["numbers"][0] if user_slots else None
@@ -876,7 +864,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_sms_webhook(sms_text: str, bot: Bot):
-    """SMS forwarder → Render URL → ይህ function — ሁለት ref support"""
     print(f"📱 SMS received: {sms_text[:100]}")
 
     info = groq_extract_payment_from_text(sms_text)
@@ -902,8 +889,8 @@ async def handle_sms_webhook(sms_text: str, bot: Bot):
             continue
 
         existing  = get_payment_by_ref(ref)
-        user_id   = existing["user_id"]    if existing else None
-        user_name = existing["user_name"]  if existing else "Unknown"
+        user_id   = existing["user_id"]     if existing else None
+        user_name = existing["user_name"]   if existing else "Unknown"
         slot_num  = existing["slot_number"] if existing else None
 
         upsert_payment(ref, user_id or 0, user_name, amount, bank, sms_ok=True, slot_number=slot_num)
@@ -923,8 +910,7 @@ async def handle_sms_webhook(sms_text: str, bot: Bot):
             if existing and existing.get("user_id"):
                 await bot.send_message(
                     chat_id=existing["user_id"],
-                    text="📱 SMS ተቀብዬአለሁ!
-⏳ Screenshot እስካልከ ድረስ እጠብቃለሁ።"
+                    text="📱 SMS ተቀብዬአለሁ!\n⏳ Screenshot እስካልከ ድረስ እጠብቃለሁ።"
                 )
                 break
 
@@ -937,7 +923,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or "ተጠቃሚ"
 
-    # ==================== TEACHING MODE ====================
     if user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
         session = admin_teach_sessions[user_id]
         session["history"].append({"role": "user", "content": raw_text})
@@ -955,7 +940,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
-    # ==================== NORMAL MODE ====================
     data       = load_data()
     full_state = build_full_state_for_ai(data)
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
@@ -994,7 +978,6 @@ class SMSWebhookHandler(BaseHTTPRequestHandler):
             raw_body = self.rfile.read(length).decode("utf-8", errors="ignore")
             print(f"📥 Webhook POST: {raw_body[:200]}")
 
-            # plain text ወይም JSON ሁሉም ተቀበል
             sms_text = raw_body
             try:
                 parsed = json.loads(raw_body)
@@ -1057,8 +1040,8 @@ def main():
     app.add_handler(CommandHandler("paid",          mark_paid_cmd))
     app.add_handler(CommandHandler("mkr",           teach_cmd))
     app.add_handler(CommandHandler("805",           teach_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO,                      handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,    handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     thread = threading.Thread(target=run_server, args=(app.bot,))
