@@ -485,7 +485,16 @@ def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str) -
 ግማሽ: "21+", "21ግማሽ", "21half", "21 200"
 ብዙ ቁጥር: "10 16 21ግማሽ" → 10=ሙሉ, 16=ሙሉ, 21=ግማሽ
 
-Admin ያስተማሩ ቃላት ሁሉ ትክክለኛ ናቸው። ለምሳሌ "yaz", "ያዝ", "book", "hold" = ያዝ ማለት ነው።
+========= BOOKING KEYWORDS (ሁሉም = ያዝ ማለት ነው) =========
+"yaz", "ያዝ", "book", "hold", "ale", "አለ", "alew", "አለው", "register",
+"ያዝልኝ", "ያዝልን", "እያዝኩ", "ምዝገባ", "እፈልጋለሁ", "እፈልጋለን", "give me",
+"wanna", "want", "need", "gimme", "take", "እወስዳለሁ", "እወስዳለን"
+
+CRITICAL RULE: ቁጥር + ማንኛውም ቃል = ቀጥታ book። አትጠይቅ።
+ምሳሌ: "61 ale wey" → book_full number=61
+ምሳሌ: "36 እፈልጋለሁ" → book_full number=36
+ምሳሌ: "21 wanna" → book_full number=21
+
 Admin rules ውስጥ ያለ ማንኛውም ቋንቋ ወይም ቃል ተቀበልና ተጠቀምበት።
 
 ========= የአሁን ሎተሪ ሁኔታ =========
@@ -545,31 +554,42 @@ def ai_teach_brain(history: list, new_message: str, existing_rules: list) -> dic
     )
     existing_rules_text = "\n".join(f"- {r}" for r in existing_rules) if existing_rules else "ምንም የለም"
 
-    done_keywords = ["ጨረስኩ", "ጨርሻለሁ", "ጨርሻለው", "አልቋል", "በቃ", "done", "finish", "እሺ ጨረስኩ"]
-    is_done = any(kw in new_message.lower() for kw in done_keywords)
+    is_done = False  # Gemini ራሱ context አንብቦ status:done ይወስናል
 
-    prompt = f"""አንተ የሎተሪ bot AI ነህ። አሁን Admin ጋር በጥልቀት እየተወያየህ ነው።
-አንተ passive ተማሪ አይደለህም — እንደ partner ታወራለህ። ሃሳብ ትለዋወጣለህ።
+    prompt = f"""አንተ AI assistant ነህ — ልክ እንደ Gemini app። Admin ጋር ሙሉ ነፃ ውይይት ታደርጋለህ።
+ስለ ምንም ማውራት ትችላለህ — ቀልድ፣ ሃሳብ፣ ክርክር፣ ማንኛውም ነገር።
+ግን አንድ ነገር ሁሌ አትዘነጋ: ይህ session ለማስተማር ነው — admin ህግ ሲነግርህ ቀጥታ ትቀበለዋለህ።
 
 ========= አሁን ያሉ ህጎች =========
 {existing_rules_text}
 
 ========= ውይይት ታሪክ =========
 {history_text}
-Admin አዲስ: "{new_message}"
+Admin: "{new_message}"
 
-========= ህጎች =========
-1. Admin ያለው ግልጽ ከሆነ → "ገባኝ! [ያለውን ደግም] — ትክክል ነው?" ብለህ አረጋግጥ
-2. ግልጽ ካልሆነ → ጠይቅ "... ማለት ነው?"
-3. አስተያየት ካለህ → ተናገር (አጭር)
-4. {"Admin ጨርሻለሁ አለ → ሁሉንም ህጎች ጠቅልለህ ስጥ" if is_done else "ውይይቱን ቀጥል"}
-5. አማርኛ ብቻ። አጭር መልስ።
+========= አወራር style =========
+- ልክ እንደ Gemini app — casual, ነፃ, ሰው-like
+- አማርኛ በዋናነት፣ Amharic/English mix ተቀበል
+- አጭር ወይም ረዥም — ለ context የሚስማማ
+- ሃሳብ ካለህ ተናገር፣ ጥያቄ ካለህ ጠይቅ፣ ቀልድ ካለ ቀልድ
+- "ትክክል ነው?" ብለህ አታስቸግር — ቀጥታ ምላሽ ስጥ
 
-JSON ብቻ ስጥ (markdown የለ):
-{{"status":"learning","reply":"ገባኝ! [ያለውን ደግም] — ትክክል?"}}
-{{"status":"clarify","reply":"... ማለት ነው?"}}
-{{"status":"opinion","reply":"አስተያየቴ: ..."}}
-{{"status":"done","rules":["ህግ1","ህግ2",...],"reply":"✅ ሁሉንም ጠቅልዬ ተማርኩ! ..."}}
+========= ህጎችን ስለ መቀበል =========
+- Admin ህግ/መመሪያ ሲነግርህ → status:"confirm" + rules list ውስጥ አስቀምጥ
+- "አዎ/እሺ/ok/awo/apo/yes" ሲባል → status:"saved" + "ገባኝ 👍" ብቻ
+- "አይ/no" ሲባል → status:"clarify"
+- ውይይቱ ጸጥ ሲል ወይም ርዕሱ አልቆ ሲታይ → status:"ask_done" + "ሌላ ነገር አለ? 😊" ብትጠይቅ
+- Admin "የለም/አይ/yellem/nope" ቢል ከ ask_done በኋላ → status:done
+- Admin ማስተማሩን እንደጨረሰ context ካሳየ ("ምናምን የለም", "አበቃ", "bye", "yellem" — ስለ ማስተማር session ሲናገር) → status:done። ግን "ዛሬ ሥራ ጨረስኩ" አይነት ስለ ሌላ ነገር ከሆነ → status:chat ብቻ።
+- ህግ ካልሆነ ቀላል ውይይት ከሆነ → status:"chat" + rules:[]
+
+JSON ብቻ (markdown የለ):
+{{"status":"chat","rules":[],"reply":"..."}}
+{{"status":"confirm","rules":["ህጉ እዚህ"],"reply":"..."}}
+{{"status":"saved","rules":[],"reply":"ገባኝ 👍"}}
+{{"status":"clarify","rules":[],"reply":"..."}}
+{{"status":"ask_done","rules":[],"reply":"ሌላ ነገር አለ? 😊"}}
+{{"status":"done","rules":["ህግ1","ህግ2"],"reply":"✅ ሁሉም ተቀመጠ!"}}
 
 JSON ብቻ:"""
 
@@ -750,8 +770,37 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.args[0] == "reset":
-        delete_all_admin_rules()
-        await update.message.reply_text("🗑️ ሁሉም ህጎች ተሰርዘዋል።")
+        # /mkr reset all → ሁሉም ይሰረዛሉ
+        if len(context.args) == 1 or context.args[1].lower() == "all":
+            delete_all_admin_rules()
+            await update.message.reply_text("🗑️ ሁሉም ህጎች ተሰርዘዋል።")
+            return
+        # /mkr reset 1 3 5 → ያ ቁጥሮች ብቻ
+        try:
+            indices = [int(x) for x in context.args[1:]]
+        except ValueError:
+            await update.message.reply_text("❌ ቁጥሮች ብቻ ጻፍ። ምሳሌ: /mkr reset 1 3 5")
+            return
+        rules = load_admin_rules()
+        to_delete = []
+        for idx in indices:
+            if 1 <= idx <= len(rules):
+                to_delete.append(rules[idx - 1])
+            else:
+                await update.message.reply_text(f"❌ {idx} የለም። /mkr list ተመልከት።")
+                return
+        try:
+            conn = get_db()
+            cur  = conn.cursor()
+            for rule in to_delete:
+                cur.execute("DELETE FROM admin_rules WHERE rule=%s", (rule,))
+            conn.commit()
+            cur.close()
+            conn.close()
+            deleted = "\n".join(f"- {r}" for r in to_delete)
+            await update.message.reply_text(f"🗑️ ተሰርዘዋል:\n{deleted}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {e}")
         return
 
     rule = " ".join(context.args)
@@ -821,6 +870,66 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or "ተጠቃሚ"
+
+    # ==================== TEACH MODE PHOTO ====================
+    if user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
+        try:
+            photo     = update.message.photo[-1]
+            file      = await context.bot.get_file(photo.file_id)
+            img_bytes = await file.download_as_bytearray()
+            b64       = base64.b64encode(bytes(img_bytes)).decode("utf-8")
+
+            session        = admin_teach_sessions[user_id]
+            existing_rules = load_admin_rules()
+            history_text   = "\n".join(
+                f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
+                for m in session["history"]
+            )
+            existing_rules_text = "\n".join(f"- {r}" for r in existing_rules) if existing_rules else "ምንም የለም"
+
+            key    = get_next_gemini_key()
+            client = genai.Client(api_key=key)
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=[
+                    types.Part.from_bytes(data=bytes(img_bytes), mime_type="image/jpeg"),
+                    f"""አንተ AI assistant ነህ። ልክ እንደ Gemini app። Admin photo ልኮልሃል — ሊያሳይህ፣ ሊያስረዳህ ወይም ሊጠይቅህ ነው።
+
+ፎቶውን ተመልከትና ልክ እንደ ወዳጅ ሆነህ ምላሽ ስጥ። ምን እንደሚያሳይ ተናገር፣ ሃሳብ ካለህ ስጥ፣ ጥያቄ ካለህ ጠይቅ።
+
+ውይይት ታሪክ (context):
+{history_text}
+
+አሁን ያሉ ህጎች: {existing_rules_text}
+
+ህግ/መመሪያ ካለ rules ውስጥ አስቀምጥ — ህግ ካልሆነ rules=[] ብቻ።
+casual አማርኛ። markdown የለ።
+
+JSON ብቻ:
+{{"status":"chat","rules":[],"reply":"..."}}
+{{"status":"confirm","rules":["ህጉ"],"reply":"..."}}
+
+JSON ብቻ:"""
+                ],
+                config=types.GenerateContentConfig(max_output_tokens=500, temperature=0.4)
+            )
+            raw   = response.text.strip()
+            clean = re.sub(r'```(?:json)?', '', raw).strip()
+            match = re.search(r'\{.*?\}', clean, re.DOTALL)
+            result = json.loads(match.group()) if match else {"status": "chat", "rules": [], "reply": raw}
+
+            reply     = result.get("reply", "ፎቶ ደረሰኝ 👍")
+            new_rules = result.get("rules", [])
+            session["history"].append({"role": "user", "content": "[photo]"})
+            session["history"].append({"role": "assistant", "content": reply})
+            for rule in new_rules:
+                if rule:
+                    save_admin_rule(rule)
+            await update.message.reply_text(reply)
+        except Exception as e:
+            print(f"❌ teach photo error: {e}")
+            await update.message.reply_text("❌ ፎቶ ማንበብ አልተቻለም።")
+        return
 
     await update.message.reply_text("⏳ Screenshot እየተመረመረ ነው...")
 
@@ -927,14 +1036,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = admin_teach_sessions[user_id]
         session["history"].append({"role": "user", "content": raw_text})
         existing_rules = load_admin_rules()
-        result = ai_teach_brain(session["history"], raw_text, existing_rules)
-        reply  = result.get("reply", "ገባኝ!")
-        status = result.get("status", "learning")
+        result    = ai_teach_brain(session["history"], raw_text, existing_rules)
+        reply     = result.get("reply", "ገባኝ!")
+        status    = result.get("status", "chat")
+        new_rules = result.get("rules", [])
         session["history"].append({"role": "assistant", "content": reply})
-        if status == "done":
-            new_rules = result.get("rules", [])
+        if status in ("confirm", "saved", "chat", "ask_done"):
             for rule in new_rules:
-                save_admin_rule(rule)
+                if rule:
+                    save_admin_rule(rule)
+            if new_rules:
+                print(f"📚 Rules saved: {new_rules}")
+        if status == "done":
+            for rule in new_rules:
+                if rule:
+                    save_admin_rule(rule)
             admin_teach_sessions[user_id]["active"] = False
             print(f"📚 Teaching done. {len(new_rules)} rules saved.")
         await update.message.reply_text(reply)
