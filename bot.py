@@ -8,19 +8,16 @@ import psycopg2.extras
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from groq import Groq
 from google import genai
 from google.genai import types
-import base64
 
 # ==================== CONFIG ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID  = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 DATABASE_URL       = os.getenv("DATABASE_URL")
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 DATA_FILE          = "lottery_data.json"
 
-# ==================== GEMINI MULTI-KEY ROTATION + TOKEN TRACKING ====================
+# ==================== GEMINI MULTI-KEY ROTATION ====================
 GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),  os.getenv("GEMINI_API_KEY_2"),
     os.getenv("GEMINI_API_KEY_3"),  os.getenv("GEMINI_API_KEY_4"),
@@ -31,56 +28,11 @@ GEMINI_KEYS = [
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 gemini_key_index = 0
 
-gemini_token_usage: dict = {}
-gemini_total_tokens: int = 0
-GEMINI_KEY_LIMIT = 500_000
-
 def get_next_gemini_key() -> str:
     global gemini_key_index
-    for _ in range(len(GEMINI_KEYS)):
-        key         = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
-        gemini_key_index += 1
-        key_preview = key[:8] + "..."
-        usage       = gemini_token_usage.get(key_preview, {})
-        if usage.get("total", 0) < GEMINI_KEY_LIMIT:
-            return key
     key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
     gemini_key_index += 1
     return key
-
-def track_token_usage(key_preview: str, input_tokens: int, output_tokens: int):
-    global gemini_total_tokens
-    if key_preview not in gemini_token_usage:
-        gemini_token_usage[key_preview] = {"input": 0, "output": 0, "total": 0, "calls": 0}
-    gemini_token_usage[key_preview]["input"]  += input_tokens
-    gemini_token_usage[key_preview]["output"] += output_tokens
-    gemini_token_usage[key_preview]["total"]  += input_tokens + output_tokens
-    gemini_token_usage[key_preview]["calls"]  += 1
-    gemini_total_tokens += input_tokens + output_tokens
-
-def build_token_report() -> str:
-    if not gemini_token_usage:
-        return "📊 እስካሁን token አልተጠቀሰም።"
-    lines = [f"📊 Gemini Token Usage Report\n{'='*30}"]
-    grand_total = 0
-    for key_preview, usage in gemini_token_usage.items():
-        total    = usage["total"]
-        pct      = (total / GEMINI_KEY_LIMIT) * 100
-        bar      = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        status   = "✅" if pct < 80 else ("⚠️" if pct < 95 else "❌")
-        lines.append(
-            f"\n🔑 Key: {key_preview}\n"
-            f"  {status} [{bar}] {pct:.1f}%\n"
-            f"  📥 Input:  {usage['input']:,} tokens\n"
-            f"  📤 Output: {usage['output']:,} tokens\n"
-            f"  📊 Total:  {total:,} / {GEMINI_KEY_LIMIT:,}\n"
-            f"  📞 Calls:  {usage['calls']}"
-        )
-        grand_total += total
-    lines.append(f"\n{'='*30}")
-    lines.append(f"🔢 ጠቅላላ tokens: {grand_total:,}")
-    lines.append(f"🔑 Active keys:  {len(GEMINI_KEYS)}")
-    return "\n".join(lines)
 
 # ==================== LOTTERY TEMPLATE ====================
 LOTTERY_TEMPLATE = """በ 400 ብር 5 ቁጥሮችን በተከታታይ በመያዝ እድሎን ይሞክሩ ለ 20 ሰው ብቻ ፈጣን ዕድል መልካም ዕድል
@@ -99,7 +51,7 @@ CBE 1000641057146 biniyam dawit
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
 
-# ==================== DATABASE ====================
+# ==================== DATABASE (NEON POSTGRES) ====================
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -116,32 +68,10 @@ def init_db():
             )
         """)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id          SERIAL PRIMARY KEY,
-                user_id     BIGINT,
-                user_name   TEXT,
-                ref         TEXT UNIQUE,
-                amount      FLOAT,
-                bank        TEXT,
-                photo_ok    BOOLEAN DEFAULT FALSE,
-                sms_ok      BOOLEAN DEFAULT FALSE,
-                status      TEXT DEFAULT 'pending',
-                slot_number INT,
-                created_at  TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS used_refs (
+            CREATE TABLE IF NOT EXISTS admin_chat_history (
                 id         SERIAL PRIMARY KEY,
-                ref        TEXT UNIQUE NOT NULL,
-                user_id    BIGINT,
-                used_at    TIMESTAMPTZ DEFAULT NOW()
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS group_commands (
-                id         SERIAL PRIMARY KEY,
-                command    TEXT NOT NULL,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """)
@@ -173,6 +103,7 @@ def save_admin_rule(rule: str):
         conn.commit()
         cur.close()
         conn.close()
+        print(f"✅ Rule saved: {rule}")
     except Exception as e:
         print(f"❌ save_admin_rule error: {e}")
 
@@ -184,101 +115,58 @@ def delete_all_admin_rules():
         conn.commit()
         cur.close()
         conn.close()
+        print("✅ All rules deleted")
     except Exception as e:
         print(f"❌ delete_all_admin_rules error: {e}")
 
-def delete_specific_rule(rule_text: str):
+def load_admin_chat_history(limit: int = 30) -> list:
     try:
         conn = get_db()
         cur  = conn.cursor()
-        cur.execute("DELETE FROM admin_rules WHERE rule = %s", (rule_text,))
-        if cur.rowcount == 0:
-            cur.execute("DELETE FROM admin_rules WHERE rule ILIKE %s", (f"%{rule_text[:30]}%",))
-        conn.commit()
-        deleted = cur.rowcount
+        cur.execute(
+            "SELECT role, content FROM admin_chat_history ORDER BY id DESC LIMIT %s",
+            (limit,)
+        )
+        rows = cur.fetchall()
         cur.close()
         conn.close()
-        print(f"🗑️ Deleted rule (matched {deleted}): {rule_text[:50]}")
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
     except Exception as e:
-        print(f"❌ delete_specific_rule error: {e}")
+        print(f"❌ load_admin_chat_history error: {e}")
+        return []
+
+def save_admin_chat_message(role: str, content: str):
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO admin_chat_history (role, content) VALUES (%s, %s)",
+            (role, content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ save_admin_chat_message error: {e}")
+
+def clear_admin_chat_history():
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM admin_chat_history")
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Chat history cleared")
+    except Exception as e:
+        print(f"❌ clear_admin_chat_history error: {e}")
 
 def build_admin_rules_text() -> str:
     rules = load_admin_rules()
     if not rules:
         return ""
-    lines = "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
-    return f"\n========= Admin ያስተማረኝ ህጎች (እነዚህ ሁሉንም ነገር OVERRIDE ያደርጋሉ) =========\n{lines}\n"
-
-# ==================== PAYMENT DB HELPERS ====================
-
-def is_ref_used(ref: str) -> bool:
-    try:
-        conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("SELECT id FROM used_refs WHERE ref=%s", (ref,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return row is not None
-    except Exception as e:
-        print(f"❌ is_ref_used error: {e}")
-        return False
-
-def mark_ref_used(ref: str, user_id: int):
-    try:
-        conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("INSERT INTO used_refs (ref, user_id) VALUES (%s, %s) ON CONFLICT DO NOTHING", (ref, user_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ mark_ref_used error: {e}")
-
-def get_payment_by_ref(ref: str) -> dict:
-    try:
-        conn = get_db()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM payments WHERE ref=%s", (ref,))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        return dict(row) if row else None
-    except Exception as e:
-        print(f"❌ get_payment_by_ref error: {e}")
-        return None
-
-def upsert_payment(ref: str, user_id: int, user_name: str, amount: float,
-                   bank: str, photo_ok: bool = False, sms_ok: bool = False,
-                   slot_number: int = None):
-    try:
-        conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO payments (ref, user_id, user_name, amount, bank, photo_ok, sms_ok, slot_number)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ref) DO UPDATE SET
-                photo_ok    = payments.photo_ok OR EXCLUDED.photo_ok,
-                sms_ok      = payments.sms_ok   OR EXCLUDED.sms_ok,
-                amount      = CASE WHEN EXCLUDED.sms_ok THEN EXCLUDED.amount ELSE payments.amount END,
-                slot_number = COALESCE(EXCLUDED.slot_number, payments.slot_number)
-        """, (ref, user_id, user_name, amount, bank, photo_ok, sms_ok, slot_number))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ upsert_payment error: {e}")
-
-def set_payment_approved(ref: str):
-    try:
-        conn = get_db()
-        cur  = conn.cursor()
-        cur.execute("UPDATE payments SET status='approved' WHERE ref=%s", (ref,))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"❌ set_payment_approved error: {e}")
+    lines = "\n".join(f"- {r}" for r in rules)
+    return f"\n========= Admin ያስተማረኝ ህጎች =========\n{lines}\n"
 
 # ==================== DATA MANAGEMENT ====================
 
@@ -314,13 +202,6 @@ def get_slot_by_number(number: int, data: dict):
         if number in slot["numbers"]:
             return slot_id, slot
     return None, None
-
-def get_slot_by_user(user_id: int, data: dict):
-    results = []
-    for slot_id, slot in data["slots"].items():
-        if slot["p1_id"] == user_id or slot["p2_id"] == user_id:
-            results.append((slot_id, slot))
-    return results
 
 def build_numbers_text(data: dict) -> str:
     groups = []
@@ -374,41 +255,12 @@ def build_full_state_for_ai(data: dict) -> str:
                 lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ግማሽ ሙሉ | p1={slot['p1_name']} (ID:{slot['p1_id']}) {p1_paid} | p2={slot['p2_name']} (ID:{slot['p2_id']}) {p2_paid}")
     filled  = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
     summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
-    state   = summary + "\n".join(lines)
-
-    try:
-        conn = get_db()
-        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT 50")
-        payments = cur.fetchall()
-        cur.close()
-        conn.close()
-
-        if payments:
-            total_approved = sum(p["amount"] for p in payments if p["status"] == "approved" and p["amount"])
-            total_pending  = sum(p["amount"] for p in payments if p["status"] == "pending" and p["amount"])
-            pay_lines = [
-                f"\n--- Payment Summary ---",
-                f"✅ Approved ጠቅላላ: {total_approved:.0f} ብር",
-                f"⏳ Pending ጠቅላላ: {total_pending:.0f} ብር",
-                f"\n--- Payment Details (ቅርብ 50) ---"
-            ]
-            for p in payments:
-                pay_lines.append(
-                    f"User:{p['user_name']} (ID:{p['user_id']}) | Ref:{p['ref']} | "
-                    f"{p['amount']}ብር | {p['bank']} | {p['status']} | "
-                    f"photo:{'✅' if p['photo_ok'] else '❌'} sms:{'✅' if p['sms_ok'] else '❌'}"
-                )
-            state += "\n" + "\n".join(pay_lines)
-    except Exception as e:
-        print(f"❌ payment state error: {e}")
-
-    return state
+    return summary + "\n".join(lines)
 
 # ==================== GEMINI AI CALL ====================
 
-def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) -> str:
-    for attempt in range(len(GEMINI_KEYS) * 2):
+def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
+    for attempt in range(2):
         key         = get_next_gemini_key()
         key_preview = key[:8] + "..." if key else "None"
         try:
@@ -421,14 +273,7 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
                     temperature=temperature,
                 )
             )
-            try:
-                usage      = response.usage_metadata
-                input_tok  = usage.prompt_token_count     or 0
-                output_tok = usage.candidates_token_count or 0
-                track_token_usage(key_preview, input_tok, output_tok)
-                print(f"✅ Gemini OK (key: {key_preview}) | in={input_tok} out={output_tok}")
-            except Exception as te:
-                print(f"✅ Gemini OK (key: {key_preview}) | token err: {te}")
+            print(f"✅ Gemini OK (key: {key_preview})")
             return response.text.strip()
         except Exception as e:
             err = str(e)
@@ -436,9 +281,6 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
                 reason = "❌ API Key ትክክል አይደለም"
             elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
                 reason = "❌ Quota ተጠቀሰ"
-                if key_preview not in gemini_token_usage:
-                    gemini_token_usage[key_preview] = {"input": 0, "output": 0, "total": 0, "calls": 0}
-                gemini_token_usage[key_preview]["total"] = GEMINI_KEY_LIMIT
             elif "PERMISSION_DENIED" in err:
                 reason = "❌ Permission የለም"
             elif "UNAVAILABLE" in err or "503" in err:
@@ -451,347 +293,131 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
     print("🔴 Gemini ሙሉ በሙሉ አልሰራም")
     return ""
 
-# ==================== GROQ PAYMENT EXTRACTION ====================
+# ==================== ADMIN PRIVATE GEMINI CHAT ====================
 
-def groq_extract_payment_from_text(text: str) -> dict:
-    try:
-        client = Groq(api_key=GROQ_API_KEY)
-        prompt = f"""Extract ALL transaction reference IDs from this SMS/text. Return JSON only, no markdown.
+def admin_gemini_chat(user_message: str, data: dict) -> str:
+    """Admin DM ውስጥ ሙሉ context ያለው Gemini ውይይት"""
+    full_state   = build_full_state_for_ai(data)
+    admin_rules  = build_admin_rules_text()
+    history      = load_admin_chat_history(limit=30)
 
-Text: "{text}"
+    history_text = "\n".join(
+        f"{'Admin' if m['role']=='user' else 'Gemini'}: {m['content']}"
+        for m in history
+    ) if history else "(ምንም ታሪክ የለም)"
 
-Rules:
-- refs: LIST of ALL reference/transaction IDs found.
-- amount: ETB value (number only)
-- bank: "CBE", "TELEBIRR", "AWASH", or "DASHEN"
+    prompt = f"""አንተ ሙሉ የሎተሪ ስርዓት Gemini ነህ። Admin ጋር በ private ታወራለህ።
+ሁሉንም ታወቃለህ — slots፣ ተጫዋቾች፣ ክፍያ፣ ህጎች።
 
-Return: {{"refs":["FT26149R63JM"],"amount":50.0,"bank":"CBE"}}
-If not a payment: {{"refs":[],"amount":null,"bank":null}}
-
-JSON only:"""
-
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.1,
-        )
-        raw   = response.choices[0].message.content.strip()
-        clean = re.sub(r'```(?:json)?', '', raw).strip()
-        result = json.loads(clean)
-        if "ref" in result and "refs" not in result:
-            result["refs"] = [result["ref"]] if result.get("ref") else []
-        return result
-    except Exception as e:
-        print(f"❌ groq_extract_payment_from_text error: {e}")
-        return {"refs": [], "amount": None, "bank": None}
-
-def groq_extract_payment_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
-    try:
-        client    = Groq(api_key=GROQ_API_KEY)
-        b64_image = base64.b64encode(image_bytes).decode("utf-8")
-        prompt    = """Extract payment info from this receipt/screenshot. Return JSON only, no markdown.
-
-Rules:
-- ref: transaction/receipt/reference ID or number
-- amount: number only (ETB value sent)
-- bank: "CBE", "TELEBIRR", "AWASH", or "DASHEN"
-
-Return: {"ref":"...","amount":50.0,"bank":"CBE"}
-If not a payment: {"ref":null,"amount":null,"bank":null}
-
-JSON only:"""
-
-        response = client.chat.completions.create(
-            model="llama-4-scout-17b-16e-instruct",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
-                    {"type": "text", "text": prompt}
-                ]
-            }],
-            max_tokens=100,
-            temperature=0.1,
-        )
-        raw   = response.choices[0].message.content.strip()
-        clean = re.sub(r'```(?:json)?', '', raw).strip()
-        return json.loads(clean)
-    except Exception as e:
-        print(f"❌ groq_extract_payment_from_image error: {e}")
-        return {"ref": None, "amount": None, "bank": None}
-
-# ==================== PAYMENT APPROVAL LOGIC ====================
-
-async def handle_payment_match(ref: str, payment: dict, bot: Bot, data: dict):
-    user_id  = payment["user_id"]
-    amount   = payment["amount"]
-    bank     = payment["bank"]
-    slot_num = payment["slot_number"]
-
-    if is_ref_used(ref):
-        await bot.send_message(chat_id=user_id, text=f"❌ ይህ ref ({ref}) አስቀድሞ ተጠቅሟል!")
-        return
-
-    if slot_num:
-        slot_id, slot = get_slot_by_number(slot_num, data)
-    else:
-        user_slots = get_slot_by_user(user_id, data)
-        if not user_slots:
-            await bot.send_message(chat_id=user_id, text="❌ ያዝከው slot አልተገኘም።")
-            return
-        slot_id, slot = user_slots[0]
-        slot_num = slot["numbers"][0]
-
-    expected = 400.0 if slot["type"] == "full" else 200.0
-    if amount < expected:
-        await bot.send_message(
-            chat_id=user_id,
-            text=f"❌ ክፍያ አይበቃም! የላካችሁት {amount} ብር ነው። ያስፈልጋል {expected} ብር።"
-        )
-        return
-
-    if slot["p1_id"] == user_id:
-        data["slots"][slot_id]["p1_paid"] = True
-    elif slot["p2_id"] == user_id:
-        data["slots"][slot_id]["p2_paid"] = True
-
-    set_payment_approved(ref)
-    mark_ref_used(ref, user_id)
-    save_data(data)
-
-    await bot.send_message(
-        chat_id=user_id,
-        text=f"✅ ክፍያ ተረጋግጧል! {amount} ብር ({bank})\nRef: {ref}\n🎉 መልካም ዕድል!"
-    )
-    await bot.send_message(
-        chat_id=ADMIN_TELEGRAM_ID,
-        text=f"✅ AUTO APPROVED\nUser: {payment['user_name']} (ID:{user_id})\nRef: {ref}\nብር: {amount} ({bank})\nSlot: {slot_num}"
-    )
-    await update_lottery_message(bot, data)
-    print(f"✅ Auto approved: ref={ref}, user={user_id}, amount={amount}")
-
-# ==================== AI BRAIN ====================
-
-def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str, is_admin_in_group: bool = False) -> dict:
-    admin_rules = build_admin_rules_text()
-
-    if is_admin_in_group:
-        prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። ADMIN group ላይ አዛዥ ነው — ማንኛውም ትዕዛዝ ቀጥታ ፈጽም።
-
-{admin_rules if admin_rules else ""}
-
-========= የአሁን ሎተሪ ሁኔታ =========
+========= የሎተሪ ሙሉ ሁኔታ =========
 {full_state}
 
-========= Admin ትዕዛዝ =========
-Admin Name: {user_name}
-Admin ID: {user_id}
-ትዕዛዝ: "{user_message}"
+========= የተመዘገቡ ህጎች =========
+{admin_rules if admin_rules else "ምንም ህግ አልተመዘገበም"}
 
-========= ACTION ህጎች =========
-Admin group ላይ ሲጽፍ ትዕዛዙን ቀጥታ ፈጽም:
-- "X ቁጥር ለ Y ስጥ / ያዝ" → book action
-- "X ቁጥር ሰርዝ" → cancel
-- "X ከፍሏል" → mark_paid
-- "ሎተሪ message አዘምን" → action: refresh
-- ሌላ ማንኛውም ትዕዛዝ → ፈጽም ወይም reply
+========= የውይይት ታሪክ =========
+{history_text}
 
-ምሳሌ book_multiple: "86 31 21 ያዝ" →
-{{"action":"book_multiple","bookings":[{{"number":86,"type":"full"}},{{"number":31,"type":"full"}},{{"number":21,"type":"full"}}],"name":"{user_name}","reply":"✅ ተያዘ!"}}
+========= Admin አዲስ መልእክት =========
+{user_message}
 
-JSON ብቻ (markdown የለ):
-{{"action":"book_full","number":6,"name":"...","reply":"..."}}
-{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"...","reply":"..."}}
-{{"action":"cancel","number":6,"reply":"..."}}
-{{"action":"mark_paid","number":6,"which":1,"reply":"..."}}
-{{"action":"update_rule","rule":"...","reply":"✅ ተቀምጧል!"}}
-{{"action":"reply","reply":"..."}}
+========= መመሪያ =========
+- አማርኛ ብቻ መልስ
+- Admin ህግ ሲጨምር → [SAVE_RULE: ህጉን እዚህ ፃፍ] format ጨምር
+- Admin ህጎች እንዲሰረዙ ከፈለገ → [DELETE_RULES] ፃፍ  
+- ሁሉንም ጥያቄ ከ data ጋር መልስ
+- አጭር፣ ግልጽ፣ ጠቃሚ መልስ ስጥ"""
 
-JSON ብቻ:"""
+    return gemini_call(prompt, max_tokens=600, temperature=0.3)
 
-    else:
-        prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። Bot worker ነው የሚያስፈጽመው።
 
-{admin_rules if admin_rules else ""}
+def process_admin_gemini_response(response: str) -> tuple[str, list, bool]:
+    """Gemini response ውስጥ SAVE_RULE እና DELETE_RULES ያውጣ"""
+    new_rules   = []
+    delete_all  = False
+    clean_reply = response
+
+    # SAVE_RULE ፈልግ
+    save_matches = re.findall(r'\[SAVE_RULE:\s*(.+?)\]', response)
+    for rule in save_matches:
+        rule = rule.strip()
+        if rule:
+            new_rules.append(rule)
+    clean_reply = re.sub(r'\[SAVE_RULE:\s*.+?\]', '', clean_reply).strip()
+
+    # DELETE_RULES ፈልግ
+    if '[DELETE_RULES]' in response:
+        delete_all  = True
+        clean_reply = clean_reply.replace('[DELETE_RULES]', '').strip()
+
+    return clean_reply, new_rules, delete_all
+
+# ==================== GROUP AI BRAIN ====================
+
+def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str) -> dict:
+    admin_rules = build_admin_rules_text()
+    prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። Bot worker ነው የሚያስፈጽመው።
+ተጫዋቾች ብቻ ናቸው የሚናገሩህ — group ውስጥ።
 
 ========= የሎተሪ ህጎች =========
 - 20 slots (1-20), እያንዳንዱ slot 5 ቁጥሮች (slot1=1-5, slot2=6-10, ... slot20=96-100)
 - ሙሉ = 400ብር (አንድ ሰው), ግማሽ = 200ብር (ሁለት ሰዎች)
 - ሽልማት: 1ኛ=5000ብር, 2ኛ=1000ብር, 3ኛ=400ብር
 - ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ 0952346729
+- ተጫዋች የራሱን ቁጥር ብቻ ሰርዝ/ቀይር ይችላል
 
 ========= ቁጥር መያዝ ምልክቶች =========
-ሙሉ (default): "06", "36ሙሉ", "36 full"
+ሙሉ (default): "06", "36ሙሉ"
 ግማሽ: "21+", "21ግማሽ", "21half", "21 200"
 ብዙ ቁጥር: "10 16 21ግማሽ" → 10=ሙሉ, 16=ሙሉ, 21=ግማሽ
 
-========= CRITICAL: ብዙ ቁጥር = book_multiple ALWAYS =========
-Message ውስጥ 2+ ቁጥሮች ካሉ → MUST use book_multiple, NEVER book_full
-ሁሉም ቁጥሮች bookings array ውስጥ መግባት አለባቸው — አንዱም ሳይቀር!
-
-ምሳሌ 1 — "10 21 36 ያዝ":
-{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"full"}},{{"number":36,"type":"full"}}],"name":"{user_name}","reply":"እሺ ቤተሰብ ✅ 10፣ 21፣ 36 ተይዟል!"}}
-
-ምሳሌ 2 — "86 31 21 ያዝ":
-{{"action":"book_multiple","bookings":[{{"number":86,"type":"full"}},{{"number":31,"type":"full"}},{{"number":21,"type":"full"}}],"name":"{user_name}","reply":"እሺ ቤተሰብ ✅"}}
-
-ምሳሌ 3 — "5 10 21ግማሽ ያዝ":
-{{"action":"book_multiple","bookings":[{{"number":5,"type":"full"}},{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"{user_name}","reply":"እሺ ቤተሰብ ✅"}}
-
-========= BOOKING KEYWORDS =========
-"yaz","ያዝ","book","hold","ale","አለ","alew","አለው","register",
-"ያዝልኝ","ያዝልን","እያዝኩ","ምዝገባ","እፈልጋለሁ","እፈልጋለን","give me",
-"wanna","want","need","gimme","take","እወስዳለሁ","እወስዳለን"
-
-CRITICAL RULE: ቁጥር + ማንኛውም ቃል = ቀጥታ book። አትጠይቅ።
-CRITICAL RULE: 2+ ቁጥሮች = book_multiple ብቻ። ሁሉም bookings ውስጥ ይግቡ።
-
 ========= የአሁን ሎተሪ ሁኔታ =========
 {full_state}
-
+{admin_rules}
 ========= ተጠቃሚ =========
 User ID: {user_id}
 User Name: {user_name}
 መልእክት: "{user_message}"
 
-========= BLOCKED USERS ህግ (VERY IMPORTANT) =========
-Admin rules ውስጥ "X አትያዝለት" ወይም "X ታገደ/blocked" ካለ:
-1. State ላይ X ስም ፈልግ
-2. አንድ ብቻ ካለ → "ይቅርታ {user_name}፣ Admin ቁጥር እንዳትይዝ ከልክሏል 🙏" action:reply
-3. ብዙ X ካለ → admin ጠይቅ "የትኛው X? slot Y ያለው ወይስ slot Z?" action:ask_admin
-4. X state ላይ ከሌለ → admin ጠይቅ "X state ላይ አላየሁም — ተጨማሪ መረጃ ስጠኝ" action:ask_admin
-5. ተጠቃሚው ራሱ blocked user ከሆነ → ሁሉም booking ክልከል
-
 ========= ACTION ህጎች =========
-1. ቁጥር ሲጽፍ → ቀጥታ book (admin rules style ተጠቀም)
-2. ብዙ ቁጥሮች → book_multiple (ሁሉንም ያዝ)
-3. የተያዘ slot → "ተቀድመሃል ቤተሰብ 🙏"
-4. ቀድሞ የያዘ → "ይዥሄልሃለው ቤተሰብ 🙏"
-5. ክፍያ ጥያቄ → "screenshot ወይም SMS forward ልካልን ✅"
-6. mark_paid → admin ብቻ
+1. ቁጥር ሲጽፍ → ቀጥታ book → reply: "እሺ ገቢ 🙏"
+2. ውስብስብ/ግልጽ ካልሆነ → ጥያቄ ጠይቅ
+3. የተያዘ slot ሌላ ሰው ሲጠራ → reply: "ተቀድመሃል ቤተሰብ 🙏"
+4. ሰው ቀድሞ የያዘውን እንደገና ሲጠራ → reply: "ይዥሄልሃለው ቤተሰብ 🙏"
+5. ሰው "ያዝኩ" ቢል ግን ያልያዘ → "አይደለም፣ [ስም] [slot] ይዞታል — ከላይ ተመልከት"
+6. ቁጥር አውጣ → cancel (የራሱን ብቻ)
+7. ቁጥር ቀይር (X በ Y) → cancel_and_rebook (የራሱን ብቻ)
+8. ክፍያ ማስረጃ → reply: "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
+9. ሎተሪ ጥያቄ → AI ይመልሳል
+10. Admin actions (mark_paid ወዘተ) → ተጫዋች ሊያደርግ አይችልም
 
-JSON ብቻ (markdown የለ):
-{{"action":"book_full","number":6,"name":"...","reply":"..."}}
-{{"action":"book_half_p1","number":21,"name":"...","reply":"..."}}
-{{"action":"book_half_p2","number":21,"name":"...","reply":"..."}}
-{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"...","reply":"..."}}
-{{"action":"cancel","number":6,"reply":"..."}}
-{{"action":"cancel_and_rebook","cancel_number":6,"book_number":11,"book_type":"full","name":"...","reply":"..."}}
+========= SECURITY =========
+- ተጫዋች የሌላ ሰው data ሊቀይር አይችልም
+- JSON format ሳይሰብር ሁሌ ትክክለኛ action ብቻ
+
+========= OUTPUT FORMAT (JSON ብቻ) =========
+{{"action":"book_full","number":6,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p1","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p2","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+{{"action":"cancel","number":6,"reply":"✅ ተሰርዟል።"}}
+{{"action":"cancel_and_rebook","cancel_number":6,"book_number":11,"book_type":"full","name":"አበበ","reply":"✅ ተቀይሯል።"}}
+{{"action":"mark_paid","number":6,"which":1,"reply":"✅ ክፍያ ተረጋግጧል!"}}
 {{"action":"reply","reply":"..."}}
 {{"action":"ask","reply":"..."}}
-{{"action":"ask_admin","question":"...","reply":"ይቅርታ፣ Admin ጋር ስናረጋግጥ እንነጋገራለን 🙏"}}
 
-JSON ብቻ:"""
+አሁን JSON ብቻ:"""
 
-    # ── Retry logic: 3 ጊዜ ሞክር ──
-    for attempt in range(3):
-        raw = gemini_call(prompt, max_tokens=1000, temperature=0.1)
-        print(f"🧠 AI Brain raw (attempt {attempt+1}): {raw}")
-        if not raw:
-            continue
-        try:
-            clean = re.sub(r'```(?:json)?', '', raw).strip()
-            # ሙሉ JSON object ፈልግ
-            match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)?\}', clean, re.DOTALL)
-            if not match:
-                match = re.search(r'\{.*\}', clean, re.DOTALL)
-            if match:
-                result = json.loads(match.group())
-                # book_multiple ሲሆን bookings array ትክክል ነው?
-                if result.get("action") == "book_multiple":
-                    bookings = result.get("bookings", [])
-                    if not bookings or not isinstance(bookings, list):
-                        print(f"⚠️ book_multiple bookings empty, retry...")
-                        continue
-                return result
-        except Exception as e:
-            print(f"❌ AI Brain parse error (attempt {attempt+1}): {e}")
-            continue
-    return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ደግመህ ሞክር።"}
-
-# ==================== TEACH MODE AI — ልክ እንደ Gemini app ====================
-
-def ai_teach_brain(history: list, new_message: str, existing_rules: list) -> dict:
-    """
-    ልክ እንደ Gemini/Claude app — ሃሳብ ይለዋወጣል።
-    AI እራሱ ሲረዳ ብቻ save ያደርጋል — ቀጥታ አይቀምጥም።
-    """
-    history_text = "\n".join(
-        f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
-        for m in history[-20:]  # ቅርብ 20 messages ብቻ
-    )
-    existing_rules_text = (
-        "\n".join(f"{i+1}. {r}" for i, r in enumerate(existing_rules))
-        if existing_rules else "ምንም የለም"
-    )
-
-    prompt = f"""አንተ AI assistant ነህ — ልክ እንደ Gemini app ሃሳብ ትለዋወጣለህ።
-Admin ሊያስተምርህ ነው። ነፃ ወይይት አድርግ — ሳይገባህ አትቀምጥ።
-
-━━━━━━━━━━━━━━━━━━━━━━━
-📋 አሁን ያሉ ህጎች:
-━━━━━━━━━━━━━━━━━━━━━━━
-{existing_rules_text}
-
-━━━━━━━━━━━━━━━━━━━━━━━
-💬 ውይይት:
-━━━━━━━━━━━━━━━━━━━━━━━
-{history_text}
-Admin: "{new_message}"
-
-━━━━━━━━━━━━━━━━━━━━━━━
-🧠 እንዴት ትሠራለህ:
-━━━━━━━━━━━━━━━━━━━━━━━
-
-STEP 1 — ምን ዓይነት message ነው?
-  A) ጥያቄ / ሃሳብ / ወይይት → discuss, ጠይቅ
-  B) ግልጽ ህግ / behavior ለውጥ → ሲገባህ SAVE
-
-STEP 2 — ህግ ሊሆን ይችላል ብትል:
-  - ሙሉ ለሙሉ ግልጽ ነው? → ቀጥታ save (status: "saved")
-  - ያልገባህ ካለ → ጠይቅ (status: "discussing")
-  - ያሉ ህጎች ጋር conflict? → ተናገር (status: "conflict")
-
-STEP 3 — ሃሳብ ለዋወጥ rules:
-  ✅ አጭር፣ ወዳጃዊ አማርኛ — ልክ እንደ ጓደኛ
-  ✅ ያልገባህ → ምሳሌ ጠይቅ
-  ✅ "ጨረስኩ" ካለ → session ዝጋ (status: "done")
-  ✅ ግልጽ ህግ → ቀጥታ save — "ትክክል ነው? አዎ ካልክ" አትበል
-  ❌ ሁሉ ነገር ህግ አታድርግ — ወይይት ወይይት ነው
-  ❌ ረዥም explanation አትስጥ — አጭር ና ቀጥተኛ
-
-━━━━━━━━━━━━━━━━━━━━━━━
-📊 STATUS:
-━━━━━━━━━━━━━━━━━━━━━━━
-"discussing" → ወይይት / ጠይቅ / ሃሳብ ለዋወጥ
-"conflict"   → ያሉ ህጎች ጋር ይጋጫል
-"saved"      → ህጉ ሙሉ ለሙሉ ገብቷል — ቀጥታ save
-"done"       → "ጨረስኩ" / session over
-
-- "saved" → rules = [ትክክለኛ ህግ text, ሙሉ detail ጋር]
-- "conflict" → deleted_rules = [ያሮጌ exact text]
-- "saved" + conflict → ሁለቱም
-- "discussing"/"done" → rules=[], deleted_rules=[]
-
-JSON ብቻ:
-{{"status":"discussing","deleted_rules":[],"rules":[],"reply":"..."}}
-{{"status":"conflict","deleted_rules":["exact old rule"],"rules":[],"reply":"ቀደም ሲል X ብለህ ነበር — አዲሱ Y ነው፣ የቱ?"}}
-{{"status":"saved","deleted_rules":[],"rules":["ህጉ ሙሉ"],"reply":"✅ ገባኝ! _____ ብዬ ይዣለሁ።"}}
-{{"status":"done","deleted_rules":[],"rules":[],"reply":"✅ ሁሉም ገብቷል! ሌላ ጊዜ 😊"}}
-
-JSON ብቻ:"""
-
-    raw = gemini_call(prompt, max_tokens=600, temperature=0.4)
-    print(f"🎓 Teach AI raw: {raw}")
+    raw = gemini_call(prompt, max_tokens=400, temperature=0.1)
+    print(f"🧠 AI Brain raw: {raw}")
     try:
         clean = re.sub(r'```(?:json)?', '', raw).strip()
-        match = re.search(r'\{.*\}', clean, re.DOTALL)
+        match = re.search(r'\{.*?\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
-        print(f"❌ Teach AI parse error: {e}")
-    return {"status": "discussing", "deleted_rules": [], "rules": [], "reply": raw or "ገባኝ! ሌሎ?"}
+        print(f"❌ AI Brain parse error: {e}")
+    return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"}
 
 # ==================== BOT EXECUTOR ====================
 
@@ -924,132 +550,7 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
                 data["slots"][slot_id]["p1_paid"] = True
             changed = True
 
-    elif action == "update_rule":
-        rule = action_data.get("rule", "")
-        if rule:
-            save_admin_rule(rule)
-            print(f"📚 Group rule saved: {rule}")
-
     return {"data": data, "reply": reply, "changed": changed}
-
-# ==================== TEACH MODE SESSION ====================
-admin_teach_sessions: dict = {}
-
-async def _process_teach_message(update: Update, context, user_id: int, raw_text: str):
-    """Teach mode message ያስኬዳል"""
-    session        = admin_teach_sessions[user_id]
-    existing_rules = load_admin_rules()
-
-    session["history"].append({"role": "user", "content": raw_text})
-
-    result    = ai_teach_brain(session["history"], raw_text, existing_rules)
-    reply     = result.get("reply", "ገባኝ!")
-    status    = result.get("status", "discussing")
-    new_rules = result.get("rules", [])
-    del_rules = result.get("deleted_rules", [])
-
-    session["history"].append({"role": "assistant", "content": reply})
-
-    # AI ሲረዳ ቀጥታ save — "ok" አትጠብቅ
-    if status in ("saved", "done"):
-        for r in del_rules:
-            if r:
-                delete_specific_rule(r)
-                print(f"🗑️ Deleted: {r[:60]}")
-        for r in new_rules:
-            if r:
-                save_admin_rule(r)
-                print(f"✅ Saved: {r[:60]}")
-
-    if status == "done":
-        admin_teach_sessions[user_id]["active"] = False
-        print("📚 Teach session closed.")
-
-    await update.message.reply_text(reply)
-
-# ==================== ADMIN TEACH CMD ====================
-
-async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
-        return
-
-    user_id = update.effective_user.id
-
-    # ── /mkr list ──
-    if context.args and context.args[0] == "list":
-        rules = load_admin_rules()
-        if not rules:
-            await update.message.reply_text("📚 እስካሁን ምንም ህግ አልተመዘገበም።")
-        else:
-            text = "📚 የተመዘገቡ ህጎች:\n\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
-            await update.message.reply_text(text)
-        return
-
-    # ── /mkr tokens ──
-    if context.args and context.args[0] == "tokens":
-        await update.message.reply_text(build_token_report())
-        return
-
-    # ── /mkr reset ──
-    if context.args and context.args[0] == "reset":
-        if len(context.args) == 1 or (len(context.args) > 1 and context.args[1].lower() == "all"):
-            delete_all_admin_rules()
-            await update.message.reply_text("🗑️ ሁሉም ህጎች ተሰርዘዋል።")
-            return
-        try:
-            indices = [int(x) for x in context.args[1:]]
-        except ValueError:
-            await update.message.reply_text("❌ ቁጥሮች ብቻ ጻፍ። ምሳሌ: /mkr reset 1 3 5")
-            return
-        rules = load_admin_rules()
-        to_delete = []
-        for idx in indices:
-            if 1 <= idx <= len(rules):
-                to_delete.append(rules[idx - 1])
-            else:
-                await update.message.reply_text(f"❌ {idx} የለም። /mkr list ተመልከት።")
-                return
-        try:
-            conn = get_db()
-            cur  = conn.cursor()
-            for rule in to_delete:
-                cur.execute("DELETE FROM admin_rules WHERE rule=%s", (rule,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            deleted = "\n".join(f"• {r}" for r in to_delete)
-            await update.message.reply_text(f"🗑️ ተሰርዘዋል:\n{deleted}")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Error: {e}")
-        return
-
-    # ── /mkr ብቻ ወይም /mkr <text> → teach session ──
-    existing_rules = load_admin_rules()
-    rules_preview  = ""
-    if existing_rules:
-        shown = existing_rules[-5:]
-        rules_preview = f"\n\n📌 አሁን ያሉ ህጎች ({len(existing_rules)}):\n" + "\n".join(f"• {r}" for r in shown)
-        if len(existing_rules) > 5:
-            rules_preview += f"\n... እና {len(existing_rules)-5} ተጨማሪ (/mkr list ለማየት)"
-
-    admin_teach_sessions[user_id] = {
-        "active": True,
-        "history": [],
-    }
-
-    await update.message.reply_text(
-        f"📚 ዝግጁ ነኝ! አወራኝ 🤝\n"
-        f"ሁሉንም ነገር ልትነግረኝ ትችላለህ — reply style, አዲስ features, behavior...\n"
-        f"(\"ጨረስኩ\" ስትል session ይዘጋል){rules_preview}"
-    )
-
-    # /mkr <text> ካለ → ቀጥታ ወደ AI ላክ
-    if context.args:
-        first_message = " ".join(context.args)
-        await _process_teach_message(update, context, user_id, first_message)
 
 # ==================== BOT HANDLERS ====================
 
@@ -1065,9 +566,8 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text("✅ ሎተሪ ጀምሯል!")
 
+
 async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != "private":
-        return
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
     if not context.args:
@@ -1096,6 +596,25 @@ async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Slot አልተገኘም")
 
+
+async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    clear_admin_chat_history()
+    await update.message.reply_text("🗑️ የውይይት ታሪክ ተሰርዟል።")
+
+
+async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    rules = load_admin_rules()
+    if not rules:
+        await update.message.reply_text("📚 እስካሁን ምንም ህግ አልተመዘገበም።")
+    else:
+        text = "📚 የተመዘገቡ ህጎች:\n\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
+        await update.message.reply_text(text)
+
+
 async def update_lottery_message(bot: Bot, data: dict):
     if data.get("lottery_message_id") and data.get("chat_id"):
         try:
@@ -1107,220 +626,64 @@ async def update_lottery_message(bot: Bot, data: dict):
         except Exception as e:
             print(f"Message update error: {e}")
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.photo:
-        return
-
-    user_id   = update.effective_user.id
-    user_name = update.effective_user.first_name or "ተጠቃሚ"
-    is_private = update.effective_chat.type == "private"
-
-    # ========== TEACH MODE PHOTO ==========
-    if is_private and user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
-        try:
-            photo     = update.message.photo[-1]
-            file      = await context.bot.get_file(photo.file_id)
-            img_bytes = await file.download_as_bytearray()
-
-            session        = admin_teach_sessions[user_id]
-            existing_rules = load_admin_rules()
-            history_text   = "\n".join(
-                f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
-                for m in session["history"]
-            )
-            existing_rules_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(existing_rules)) if existing_rules else "ምንም የለም"
-
-            key    = get_next_gemini_key()
-            client = genai.Client(api_key=key)
-            response = client.models.generate_content(
-                model="gemini-2.5-flash-lite",
-                contents=[
-                    types.Part.from_bytes(data=bytes(img_bytes), mime_type="image/jpeg"),
-                    f"""አንተ AI assistant ነህ። Admin photo ልኮልሃል።
-
-ፎቶውን ተመልከትና ምን እንደሚያሳይ ተናገር።
-ህግ ካለ → rules ውስጥ አስቀምጥ — ህግ ካልሆነ rules=[]።
-
-ያሉ ህጎች:
-{existing_rules_text}
-
-ውይይት:
-{history_text}
-
-JSON ብቻ:
-{{"status":"discussing","deleted_rules":[],"rules":[],"reply":"..."}}
-{{"status":"saved","deleted_rules":[],"rules":["ህጉ"],"reply":"✅ ገባኝ!"}}
-
-JSON ብቻ:"""
-                ],
-                config=types.GenerateContentConfig(max_output_tokens=600, temperature=0.3)
-            )
-            raw   = response.text.strip()
-            clean = re.sub(r'```(?:json)?', '', raw).strip()
-            match = re.search(r'\{.*?\}', clean, re.DOTALL)
-            result = json.loads(match.group()) if match else {"status": "discussing", "rules": [], "deleted_rules": [], "reply": raw}
-
-            reply     = result.get("reply", "ፎቶ ደረሰኝ 👍")
-            new_rules = result.get("rules", [])
-            del_rules = result.get("deleted_rules", [])
-            status    = result.get("status", "discussing")
-
-            session["history"].append({"role": "user", "content": "[photo]"})
-            session["history"].append({"role": "assistant", "content": reply})
-
-            if status in ("saved", "done"):
-                for r in del_rules:
-                    if r:
-                        delete_specific_rule(r)
-                for r in new_rules:
-                    if r:
-                        save_admin_rule(r)
-            if status == "done":
-                admin_teach_sessions[user_id]["active"] = False
-
-            await update.message.reply_text(reply)
-        except Exception as e:
-            print(f"❌ teach photo error: {e}")
-            await update.message.reply_text("❌ ፎቶ ማንበብ አልተቻለም።")
-        return
-
-    # ========== PAYMENT PHOTO ==========
-    await update.message.reply_text("⏳ Screenshot እየተመረመረ ነው...")
-    try:
-        photo     = update.message.photo[-1]
-        file      = await context.bot.get_file(photo.file_id)
-        img_bytes = await file.download_as_bytearray()
-
-        info = groq_extract_payment_from_image(bytes(img_bytes))
-        print(f"📸 Photo payment info: {info}")
-
-        if not info.get("ref"):
-            await update.message.reply_text("❌ ከ screenshot ክፍያ መረጃ ማግኘት አልተቻለም። ግልጽ screenshot ይላኩ።")
-            return
-
-        ref    = info["ref"]
-        amount = info.get("amount") or 0.0
-        bank   = info.get("bank") or "UNKNOWN"
-
-        if is_ref_used(ref):
-            await update.message.reply_text(f"❌ ይህ ref ({ref}) አስቀድሞ ተጠቅሟል!")
-            return
-
-        data       = load_data()
-        user_slots = get_slot_by_user(user_id, data)
-        slot_num   = user_slots[0][1]["numbers"][0] if user_slots else None
-
-        upsert_payment(ref, user_id, user_name, amount, bank, photo_ok=True, slot_number=slot_num)
-
-        payment = get_payment_by_ref(ref)
-        if payment and payment["photo_ok"] and payment["sms_ok"]:
-            await handle_payment_match(ref, payment, context.bot, data)
-        else:
-            await update.message.reply_text(
-                f"✅ Screenshot ተቀብዬአለሁ!\nRef: {ref} | {bank}\n⏳ SMS confirmation እየጠበቅን ነው..."
-            )
-    except Exception as e:
-        print(f"❌ handle_photo error: {e}")
-        await update.message.reply_text("❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።")
-
-async def handle_sms_webhook(sms_text: str, bot: Bot):
-    print(f"📱 SMS received: {sms_text[:100]}")
-    info   = groq_extract_payment_from_text(sms_text)
-    print(f"📱 SMS payment info: {info}")
-    refs   = info.get("refs") or []
-    amount = info.get("amount") or 0.0
-    bank   = info.get("bank") or "UNKNOWN"
-    if not refs:
-        print("❌ SMS: ref ማግኘት አልተቻለም")
-        return
-    matched_ref     = None
-    matched_payment = None
-    data            = load_data()
-    for ref in refs:
-        if is_ref_used(ref):
-            continue
-        existing  = get_payment_by_ref(ref)
-        user_id   = existing["user_id"]     if existing else None
-        user_name = existing["user_name"]   if existing else "Unknown"
-        slot_num  = existing["slot_number"] if existing else None
-        upsert_payment(ref, user_id or 0, user_name, amount, bank, sms_ok=True, slot_number=slot_num)
-        payment = get_payment_by_ref(ref)
-        if payment and payment["photo_ok"] and payment["sms_ok"]:
-            matched_ref     = ref
-            matched_payment = payment
-            break
-    if matched_ref and matched_payment:
-        await handle_payment_match(matched_ref, matched_payment, bot, data)
-    else:
-        for ref in refs:
-            existing = get_payment_by_ref(ref)
-            if existing and existing.get("user_id"):
-                await bot.send_message(
-                    chat_id=existing["user_id"],
-                    text="📱 SMS ተቀብዬአለሁ!\n⏳ Screenshot እስካልከ ድረስ እጠብቃለሁ።"
-                )
-                break
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    raw_text   = update.message.text.strip()
-    user_id    = update.effective_user.id
-    user_name  = update.effective_user.first_name or "ተጠቃሚ"
-    is_private = update.effective_chat.type == "private"
-    is_group   = update.effective_chat.type in ("group", "supergroup")
+    raw_text  = update.message.text.strip()
+    user_id   = update.effective_user.id
+    user_name = update.effective_user.first_name or "ተጠቃሚ"
+    chat_type = update.effective_chat.type  # "private" or "group"/"supergroup"
 
-    # ==================== TEACH MODE (DM only) ====================
-    if is_private and user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
-        await _process_teach_message(update, context, user_id, raw_text)
-        return
+    # ==================== ADMIN PRIVATE → GEMINI FULL CHAT ====================
+    if user_id == ADMIN_TELEGRAM_ID and chat_type == "private":
+        data = load_data()
+        print(f"🔐 Admin private: '{raw_text}'")
 
-    # ==================== GROUP: ADMIN = FULL POWER ====================
-    if is_group and user_id == ADMIN_TELEGRAM_ID:
-        data       = load_data()
-        full_state = build_full_state_for_ai(data)
-        print(f"👑 Admin in group: '{raw_text}'")
+        # ታሪክ አስቀምጥ
+        save_admin_chat_message("user", raw_text)
 
-        action_data = ai_brain(raw_text, user_id, user_name, full_state, is_admin_in_group=True)
-        print(f"🧠 Admin Group Action: {action_data}")
-
-        if action_data.get("action") == "ask":
-            await update.message.reply_text(action_data.get("reply", "❓"))
+        # Gemini ጥራ
+        response = admin_gemini_chat(raw_text, data)
+        if not response:
+            await update.message.reply_text("❌ Gemini አልተናገረም። ቆይተህ ሞክር።")
             return
 
-        result = execute_action(action_data, user_id, data)
-        if result["changed"]:
-            save_data(result["data"])
-            await update_lottery_message(context.bot, result["data"])
-        if result["reply"]:
-            await update.message.reply_text(result["reply"])
+        # SAVE_RULE / DELETE_RULES process
+        clean_reply, new_rules, delete_all = process_admin_gemini_response(response)
+
+        if delete_all:
+            delete_all_admin_rules()
+
+        for rule in new_rules:
+            save_admin_rule(rule)
+
+        if new_rules:
+            clean_reply += f"\n\n📌 {len(new_rules)} ህግ ተመዝግቧል።"
+        if delete_all:
+            clean_reply += "\n🗑️ ሁሉም ህጎች ተሰርዘዋል።"
+
+        # Gemini reply ታሪክ አስቀምጥ
+        save_admin_chat_message("assistant", clean_reply)
+
+        await update.message.reply_text(clean_reply)
         return
 
-    # ==================== REGULAR USER ====================
+    # ==================== GROUP → NORMAL BOT MODE ====================
     data       = load_data()
     full_state = build_full_state_for_ai(data)
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
 
-    action_data = ai_brain(raw_text, user_id, user_name, full_state, is_admin_in_group=False)
+    action_data = ai_brain(raw_text, user_id, user_name, full_state)
     print(f"🧠 Action: {action_data}")
-
-    # ask_admin → admin ጠይቅ
-    if action_data.get("action") == "ask_admin":
-        question = action_data.get("question", "")
-        if question:
-            await context.bot.send_message(
-                chat_id=ADMIN_TELEGRAM_ID,
-                text=f"❓ Admin ጥያቄ:\nUser: {user_name} (ID:{user_id})\n{question}"
-            )
-        await update.message.reply_text(action_data.get("reply", "ይቅርታ፣ Admin ጋር እናረጋግጣለን 🙏"))
-        return
 
     if action_data.get("action") == "ask":
         await update.message.reply_text(action_data.get("reply", "❓"))
         return
 
     result = execute_action(action_data, user_id, data)
+
     if result["changed"]:
         save_data(result["data"])
         await update_lottery_message(context.bot, result["data"])
@@ -1330,48 +693,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(result["reply"])
 
-# ==================== SMS WEBHOOK SERVER ====================
 
-class SMSWebhookHandler(BaseHTTPRequestHandler):
-    bot_instance = None
+# ==================== KEEP ALIVE ====================
 
+class KeepAlive(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is running!")
-
-    def do_POST(self):
-        try:
-            length   = int(self.headers.get("Content-Length", 0))
-            raw_body = self.rfile.read(length).decode("utf-8", errors="ignore")
-            print(f"📥 Webhook POST: {raw_body[:200]}")
-            sms_text = raw_body
-            try:
-                parsed = json.loads(raw_body)
-                sms_text = parsed.get("sms") or parsed.get("text") or parsed.get("message") or raw_body
-            except Exception:
-                pass
-            if sms_text and SMSWebhookHandler.bot_instance:
-                import asyncio
-                asyncio.run_coroutine_threadsafe(
-                    handle_sms_webhook(sms_text, SMSWebhookHandler.bot_instance),
-                    loop=asyncio.get_event_loop()
-                )
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-        except Exception as e:
-            print(f"❌ Webhook error: {e}")
-            self.send_response(500)
-            self.end_headers()
-
     def log_message(self, format, *args):
         pass
 
-def run_server(bot_instance):
-    SMSWebhookHandler.bot_instance = bot_instance
+def run_server():
     port = int(os.getenv("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), SMSWebhookHandler).serve_forever()
+    HTTPServer(("0.0.0.0", port), KeepAlive).serve_forever()
 
 # ==================== MAIN ====================
 
@@ -1381,6 +716,10 @@ def main():
         return
 
     init_db()
+
+    thread        = threading.Thread(target=run_server)
+    thread.daemon = True
+    thread.start()
 
     import asyncio
     import telegram as tg
@@ -1403,19 +742,13 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start_lottery", start_lottery))
     app.add_handler(CommandHandler("paid",          mark_paid_cmd))
-    app.add_handler(CommandHandler("mkr",           teach_cmd))
-    app.add_handler(CommandHandler("805",           teach_cmd))
-    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(CommandHandler("rules",         rules_cmd))
+    app.add_handler(CommandHandler("clear",         clear_history_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    thread = threading.Thread(target=run_server, args=(app.bot,))
-    thread.daemon = True
-    thread.start()
-
     print(f"✅ {len(GEMINI_KEYS)} Gemini API keys loaded")
-    print(f"✅ Groq API: {'✅' if GROQ_API_KEY else '❌ Missing'}")
-    print("✅ Bot እየሰራ ነው... (Neon DB + Gemini AI + Groq Vision + SMS Webhook)")
+    print("✅ Bot እየሰራ ነው... (Neon DB + Gemini Full Context)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
