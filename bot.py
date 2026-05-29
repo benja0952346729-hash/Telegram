@@ -20,7 +20,7 @@ DATABASE_URL       = os.getenv("DATABASE_URL")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 DATA_FILE          = "lottery_data.json"
 
-# ==================== GEMINI MULTI-KEY ROTATION ====================
+# ==================== GEMINI MULTI-KEY ROTATION + TOKEN TRACKING ====================
 GEMINI_KEYS = [
     os.getenv("GEMINI_API_KEY_1"),  os.getenv("GEMINI_API_KEY_2"),
     os.getenv("GEMINI_API_KEY_3"),  os.getenv("GEMINI_API_KEY_4"),
@@ -31,11 +31,62 @@ GEMINI_KEYS = [
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 gemini_key_index = 0
 
+# Token tracking per key — key_preview → {input, output, total, calls}
+gemini_token_usage: dict = {}
+gemini_total_tokens: int = 0
+
+# Free tier daily limit per key (Gemini 2.5 Flash Lite)
+GEMINI_KEY_LIMIT = 500_000  # tokens per key per day
+
 def get_next_gemini_key() -> str:
+    """Smart key rotation — skip keys near quota limit."""
     global gemini_key_index
+    # Try each key, skip exhausted ones
+    for _ in range(len(GEMINI_KEYS)):
+        key         = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
+        gemini_key_index += 1
+        key_preview = key[:8] + "..."
+        usage       = gemini_token_usage.get(key_preview, {})
+        if usage.get("total", 0) < GEMINI_KEY_LIMIT:
+            return key
+    # All keys near limit — use next anyway
     key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
     gemini_key_index += 1
     return key
+
+def track_token_usage(key_preview: str, input_tokens: int, output_tokens: int):
+    global gemini_total_tokens
+    if key_preview not in gemini_token_usage:
+        gemini_token_usage[key_preview] = {"input": 0, "output": 0, "total": 0, "calls": 0}
+    gemini_token_usage[key_preview]["input"]  += input_tokens
+    gemini_token_usage[key_preview]["output"] += output_tokens
+    gemini_token_usage[key_preview]["total"]  += input_tokens + output_tokens
+    gemini_token_usage[key_preview]["calls"]  += 1
+    gemini_total_tokens += input_tokens + output_tokens
+
+def build_token_report() -> str:
+    if not gemini_token_usage:
+        return "📊 እስካሁን token አልተጠቀሰም።"
+    lines = [f"📊 Gemini Token Usage Report\n{'='*30}"]
+    grand_total = 0
+    for key_preview, usage in gemini_token_usage.items():
+        total    = usage["total"]
+        pct      = (total / GEMINI_KEY_LIMIT) * 100
+        bar      = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        status   = "✅" if pct < 80 else ("⚠️" if pct < 95 else "❌")
+        lines.append(
+            f"\n🔑 Key: {key_preview}\n"
+            f"  {status} [{bar}] {pct:.1f}%\n"
+            f"  📥 Input:  {usage['input']:,} tokens\n"
+            f"  📤 Output: {usage['output']:,} tokens\n"
+            f"  📊 Total:  {total:,} / {GEMINI_KEY_LIMIT:,}\n"
+            f"  📞 Calls:  {usage['calls']}"
+        )
+        grand_total += total
+    lines.append(f"\n{'='*30}")
+    lines.append(f"🔢 ጠቅላላ tokens: {grand_total:,}")
+    lines.append(f"🔑 Active keys:  {len(GEMINI_KEYS)}")
+    return "\n".join(lines)
 
 # ==================== LOTTERY TEMPLATE ====================
 LOTTERY_TEMPLATE = """በ 400 ብር 5 ቁጥሮችን በተከታታይ በመያዝ እድሎን ይሞክሩ ለ 20 ሰው ብቻ ፈጣን ዕድል መልካም ዕድል
@@ -349,7 +400,7 @@ def build_full_state_for_ai(data: dict) -> str:
 # ==================== GEMINI AI CALL ====================
 
 def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) -> str:
-    for attempt in range(2):
+    for attempt in range(len(GEMINI_KEYS) * 2):
         key         = get_next_gemini_key()
         key_preview = key[:8] + "..." if key else "None"
         try:
@@ -362,14 +413,25 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
                     temperature=temperature,
                 )
             )
-            print(f"✅ Gemini OK (key: {key_preview})")
+            # ==================== TOKEN TRACKING ====================
+            try:
+                usage      = response.usage_metadata
+                input_tok  = usage.prompt_token_count     or 0
+                output_tok = usage.candidates_token_count or 0
+                track_token_usage(key_preview, input_tok, output_tok)
+                print(f"✅ Gemini OK (key: {key_preview}) | in={input_tok} out={output_tok}")
+            except Exception as te:
+                print(f"✅ Gemini OK (key: {key_preview}) | token err: {te}")
             return response.text.strip()
         except Exception as e:
             err = str(e)
             if "API_KEY_INVALID" in err or "API key not valid" in err:
                 reason = "❌ API Key ትክክል አይደለም"
             elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                reason = "❌ Quota ተጠቀሰ"
+                reason = "❌ Quota ተጠቀሰ — ቀጣይ key እሞክራለሁ"
+                if key_preview not in gemini_token_usage:
+                    gemini_token_usage[key_preview] = {"input": 0, "output": 0, "total": 0, "calls": 0}
+                gemini_token_usage[key_preview]["total"] = GEMINI_KEY_LIMIT
             elif "PERMISSION_DENIED" in err:
                 reason = "❌ Permission የለም"
             elif "UNAVAILABLE" in err or "503" in err:
@@ -379,7 +441,7 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
             else:
                 reason = f"❌ Error: {err}"
             print(f"⚠️ Gemini attempt {attempt+1} (key: {key_preview}): {reason}")
-    print("🔴 Gemini ሙሉ በሙሉ አልሰራም")
+    print("🔴 Gemini ሙሉ በሙሉ አልሰራም — ሁሉም keys quota ሞልቷል")
     return ""
 
 # ==================== GROQ PAYMENT EXTRACTION ====================
@@ -851,6 +913,10 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "📚 የተመዘገቡ ህጎች:\n\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
             await update.message.reply_text(text)
+        return
+
+    if context.args[0] == "tokens":
+        await update.message.reply_text(build_token_report())
         return
 
     if context.args[0] == "reset":
