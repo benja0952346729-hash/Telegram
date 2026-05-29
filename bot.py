@@ -31,17 +31,12 @@ GEMINI_KEYS = [
 GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 gemini_key_index = 0
 
-# Token tracking per key — key_preview → {input, output, total, calls}
 gemini_token_usage: dict = {}
 gemini_total_tokens: int = 0
-
-# Free tier daily limit per key (Gemini 2.5 Flash Lite)
-GEMINI_KEY_LIMIT = 500_000  # tokens per key per day
+GEMINI_KEY_LIMIT = 500_000
 
 def get_next_gemini_key() -> str:
-    """Smart key rotation — skip keys near quota limit."""
     global gemini_key_index
-    # Try each key, skip exhausted ones
     for _ in range(len(GEMINI_KEYS)):
         key         = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
         gemini_key_index += 1
@@ -49,7 +44,6 @@ def get_next_gemini_key() -> str:
         usage       = gemini_token_usage.get(key_preview, {})
         if usage.get("total", 0) < GEMINI_KEY_LIMIT:
             return key
-    # All keys near limit — use next anyway
     key = GEMINI_KEYS[gemini_key_index % len(GEMINI_KEYS)]
     gemini_key_index += 1
     return key
@@ -105,7 +99,7 @@ CBE 1000641057146 biniyam dawit
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
 
-# ==================== DATABASE (NEON POSTGRES) ====================
+# ==================== DATABASE ====================
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -144,7 +138,6 @@ def init_db():
                 used_at    TIMESTAMPTZ DEFAULT NOW()
             )
         """)
-        # ==================== NEW: group_commands table ====================
         cur.execute("""
             CREATE TABLE IF NOT EXISTS group_commands (
                 id         SERIAL PRIMARY KEY,
@@ -194,11 +187,29 @@ def delete_all_admin_rules():
     except Exception as e:
         print(f"❌ delete_all_admin_rules error: {e}")
 
+def delete_specific_rule(rule_text: str):
+    """ተቃርኖ ያለው rule ን ይሰርዛል"""
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        # ትክክለኛ match ሞክር
+        cur.execute("DELETE FROM admin_rules WHERE rule = %s", (rule_text,))
+        if cur.rowcount == 0:
+            # partial match ሞክር
+            cur.execute("DELETE FROM admin_rules WHERE rule ILIKE %s", (f"%{rule_text[:30]}%",))
+        conn.commit()
+        deleted = cur.rowcount
+        cur.close()
+        conn.close()
+        print(f"🗑️ Deleted rule (matched {deleted}): {rule_text[:50]}")
+    except Exception as e:
+        print(f"❌ delete_specific_rule error: {e}")
+
 def build_admin_rules_text() -> str:
     rules = load_admin_rules()
     if not rules:
         return ""
-    lines = "\n".join(f"- {r}" for r in rules)
+    lines = "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
     return f"\n========= Admin ያስተማረኝ ህጎች (እነዚህ ሁሉንም ነገር OVERRIDE ያደርጋሉ) =========\n{lines}\n"
 
 # ==================== PAYMENT DB HELPERS ====================
@@ -413,7 +424,6 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
                     temperature=temperature,
                 )
             )
-            # ==================== TOKEN TRACKING ====================
             try:
                 usage      = response.usage_metadata
                 input_tok  = usage.prompt_token_count     or 0
@@ -428,7 +438,7 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
             if "API_KEY_INVALID" in err or "API key not valid" in err:
                 reason = "❌ API Key ትክክል አይደለም"
             elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                reason = "❌ Quota ተጠቀሰ — ቀጣይ key እሞክራለሁ"
+                reason = "❌ Quota ተጠቀሰ"
                 if key_preview not in gemini_token_usage:
                     gemini_token_usage[key_preview] = {"input": 0, "output": 0, "total": 0, "calls": 0}
                 gemini_token_usage[key_preview]["total"] = GEMINI_KEY_LIMIT
@@ -441,7 +451,7 @@ def gemini_call(prompt: str, max_tokens: int = 800, temperature: float = 0.2) ->
             else:
                 reason = f"❌ Error: {err}"
             print(f"⚠️ Gemini attempt {attempt+1} (key: {key_preview}): {reason}")
-    print("🔴 Gemini ሙሉ በሙሉ አልሰራም — ሁሉም keys quota ሞልቷል")
+    print("🔴 Gemini ሙሉ በሙሉ አልሰራም")
     return ""
 
 # ==================== GROQ PAYMENT EXTRACTION ====================
@@ -454,13 +464,11 @@ def groq_extract_payment_from_text(text: str) -> dict:
 Text: "{text}"
 
 Rules:
-- refs: LIST of ALL reference/transaction IDs found. Extract from URLs too.
-  Examples: FT26149R63JM from URL, fHCxyUS32YEla0XJer from mobile URL, DES4EVQ738 directly in text
-  If only one ref found, still return as list with one item.
+- refs: LIST of ALL reference/transaction IDs found.
 - amount: ETB value (number only)
 - bank: "CBE", "TELEBIRR", "AWASH", or "DASHEN"
 
-Return: {{"refs":["FT26149R63JM","fHCxyUS32YEla0XJer"],"amount":50.0,"bank":"CBE"}}
+Return: {{"refs":["FT26149R63JM"],"amount":50.0,"bank":"CBE"}}
 If not a payment: {{"refs":[],"amount":null,"bank":null}}
 
 JSON only:"""
@@ -480,7 +488,6 @@ JSON only:"""
     except Exception as e:
         print(f"❌ groq_extract_payment_from_text error: {e}")
         return {"refs": [], "amount": None, "bank": None}
-
 
 def groq_extract_payment_from_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> dict:
     try:
@@ -572,12 +579,10 @@ async def handle_payment_match(ref: str, payment: dict, bot: Bot, data: dict):
 def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str, is_admin_in_group: bool = False) -> dict:
     admin_rules = build_admin_rules_text()
 
-    # ==================== ADMIN IN GROUP — FULL POWER ====================
     if is_admin_in_group:
         prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። ADMIN group ላይ አዛዥ ነው — ማንኛውም ትዕዛዝ ቀጥታ ፈጽም።
 
-========= Admin ያስተማረኝ ህጎች (ሁሉንም OVERRIDE ያደርጋሉ) =========
-{admin_rules if admin_rules else "ምንም የለም"}
+{admin_rules if admin_rules else ""}
 
 ========= የአሁን ሎተሪ ሁኔታ =========
 {full_state}
@@ -593,7 +598,6 @@ Admin group ላይ ሲጽፍ ትዕዛዙን ቀጥታ ፈጽም:
 - "X ቁጥር ሰርዝ" → cancel
 - "X ከፍሏል" → mark_paid
 - "ሎተሪ message አዘምን" → action: refresh
-- "reply style ቀይር..." → action: update_rule + save new rule
 - ሌላ ማንኛውም ትዕዛዝ → ፈጽም ወይም reply
 
 ምሳሌ book_multiple: "86 31 21 ያዝ" →
@@ -610,11 +614,9 @@ JSON ብቻ (markdown የለ):
 JSON ብቻ:"""
 
     else:
-        # ==================== REGULAR USER ====================
         prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። Bot worker ነው የሚያስፈጽመው።
 
-========= Admin ያስተማረኝ ህጎች (እነዚህ ሁሉንም ነገር OVERRIDE ያደርጋሉ — reply style, behavior, ሁሉም) =========
-{admin_rules if admin_rules else "ምንም የለም"}
+{admin_rules if admin_rules else ""}
 
 ========= የሎተሪ ህጎች =========
 - 20 slots (1-20), እያንዳንዱ slot 5 ቁጥሮች (slot1=1-5, slot2=6-10, ... slot20=96-100)
@@ -627,13 +629,13 @@ JSON ብቻ:"""
 ግማሽ: "21+", "21ግማሽ", "21half", "21 200"
 ብዙ ቁጥር: "10 16 21ግማሽ" → 10=ሙሉ, 16=ሙሉ, 21=ግማሽ
 
-ምሳሌ book_multiple (ብዙ ቁጥሮች):
+ምሳሌ book_multiple:
 "86 31 21 ያዝ" → {{"action":"book_multiple","bookings":[{{"number":86,"type":"full"}},{{"number":31,"type":"full"}},{{"number":21,"type":"full"}}],"name":"{user_name}","reply":"እሺ ቤተሰብ ✅"}}
 
 ========= BOOKING KEYWORDS =========
-"yaz", "ያዝ", "book", "hold", "ale", "አለ", "alew", "አለው", "register",
-"ያዝልኝ", "ያዝልን", "እያዝኩ", "ምዝገባ", "እፈልጋለሁ", "እፈልጋለን", "give me",
-"wanna", "want", "need", "gimme", "take", "እወስዳለሁ", "እወስዳለን"
+"yaz","ያዝ","book","hold","ale","አለ","alew","አለው","register",
+"ያዝልኝ","ያዝልን","እያዝኩ","ምዝገባ","እፈልጋለሁ","እፈልጋለን","give me",
+"wanna","want","need","gimme","take","እወስዳለሁ","እወስዳለን"
 
 CRITICAL RULE: ቁጥር + ማንኛውም ቃል = ቀጥታ book። አትጠይቅ።
 
@@ -669,75 +671,106 @@ JSON ብቻ:"""
     print(f"🧠 AI Brain raw: {raw}")
     try:
         clean = re.sub(r'```(?:json)?', '', raw).strip()
-        match = re.search(r'\{.*?\}', clean, re.DOTALL)
+        match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
         print(f"❌ AI Brain parse error: {e}")
     return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ደግመህ ሞክር።"}
 
-# ==================== TEACH MODE AI ====================
+# ==================== TEACH MODE AI — ሙሉ ኃይሉን ይጠቀማል ====================
 
 def ai_teach_brain(history: list, new_message: str, existing_rules: list) -> dict:
+    """
+    ልክ እንደ Claude/Gemini app — ሙሉ AI ኃይሉን ተጠቅሞ ያወያያል።
+    ቀጥታ አይቀምጥም — ያስቀድሞ ይረዳል፣ ይጠይቃል፣ ተቃርኖ ካለ ያሳውቃል።
+    """
     history_text = "\n".join(
         f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
         for m in history
     )
-    existing_rules_text = "\n".join(f"- {r}" for r in existing_rules) if existing_rules else "ምንም የለም"
+    existing_rules_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(existing_rules)) if existing_rules else "ምንም የለም"
 
-    prompt = f"""አንተ AI assistant ነህ — ልክ እንደ Claude/Gemini app። Admin ጋር ሙሉ ነፃ ውይይት ታደርጋለህ።
-ስለ ምንም ማውራት ትችላለህ — ቀልድ፣ ሃሳብ፣ ክርክር፣ ማንኛውም ነገር።
-ግን አንድ ነገር ሁሌ አትዘነጋ: ይህ session ለማስተማር ነው — admin ህግ ሲነግርህ ቀጥታ ትቀበለዋለህ።
+    prompt = f"""አንተ AI assistant ነህ — ሙሉ ኃይልህን ተጠቀም ልክ እንደ Gemini/Claude app።
+Admin ከዚህ session ሊያስተምርህ ነው። 
 
-CRITICAL: Admin የሚነግርህ ሁሉ — reply style, behavior, አዲስ features, ሁሉም — ሙሉ በሙሉ ትቀበልና ትተገብራለህ።
-ህጎቹ ሲቀመጡ ሁሉንም bot behavior OVERRIDE ያደርጋሉ።
+======================================================
+🧠 አስፈላጊ መርሆዎች — እነዚህ ሁሌ ይሰሩ:
+======================================================
 
-========= አሁን ያሉ ህጎች =========
+1. ቀጥታ አትቀበልና አትቀምጥ — UNDERSTAND ካረግህ በኋላ ብቻ save
+2. Admin ሲናገር → ምን INTENT አለበት? ምን ለማለት ፈለገ?
+3. ያልገባህ ካለ → ምሳሌ ጠይቅ፣ አሳጥረህ ጠይቅ
+4. ያለው rules ጋር CONFLICT አለ? → ግልጽ አድርጎ ጠይቅ፣ ምን ያረጋል?
+5. ህግ ከመቀመጡ በፊት → ለAdmin ተረጋጋጥ (summarize ና confirm)
+6. Conflict ሲኖር → ቀደምቱ rule ትክክል ወይም አዲሱ? ጠይቅ
+7. "ok/አዎ/awo" ካለ → confirmed, save
+8. "አይ/no" ካለ → clarify ጠይቅ
+
+======================================================
+🚦 CONFLICT DETECTION — ዋናው ሥራ:
+======================================================
+አዲስ ህግ ሲሰጥህ ያሉ rules ሁሉ scan አድርግ:
+- ተቃርኖ አለ? → "ቀደም ሲል '{ቀደምቱ ህግ}' ብለህ ነበር። አሁን '{አዲሱ}' ትላለህ — የቱ ትክክል?" ብለህ ጠይቅ
+- ወደፊት ሊደናቀፍ የሚችል? → ተናገር
+- Overlap አለ? → አዋህዶ ጻፍ
+
+======================================================
+📋 አሁን ያሉ ህጎች:
+======================================================
 {existing_rules_text}
 
-========= ውይይት ታሪክ =========
+======================================================
+💬 ውይይት ታሪክ:
+======================================================
 {history_text}
 Admin: "{new_message}"
 
-========= አወራር style =========
-- ልክ እንደ Claude/Gemini app — casual, ነፃ, ሰው-like
-- አማርኛ በዋናነት፣ Amharic/English mix ተቀበል
-- አጭር ወይም ረዥም — ለ context የሚስማማ
-- ሃሳብ ካለህ ተናገር፣ ጥያቄ ካለህ ጠይቅ
-- "ትክክል ነው?" ብለህ አታስቸግር — ቀጥታ ምላሽ ስጥ
+======================================================
+📝 Response style:
+======================================================
+- አማርኛ — casual, ሰው-like, ወዳጃዊ
+- ህግ ሲቀበል → ዓረፍተ ነገሩን በራስህ ቃል summarize ና ጠይቅ
+- አጭር ወይም ረዥም — ለ context
+- Conflict ካለ → ቀጥታ ተናገር: "ትንሽ ግር ብሎኛል — ቀደም..."
+- ሳይገባህ → "ምሳሌ ስጠኝ ደግሞ ሰምቻለሁ"
 
-========= ህጎችን ስለ መቀበል =========
-- Admin ህግ/መመሪያ ሲነግርህ → status:"confirm" + rules list ውስጥ አስቀምጥ (ሙሉ detail ጨምር)
-- "አዎ/እሺ/ok/awo/apo/yes" ሲባል → status:"saved"
-- "አይ/no" ሲባል → status:"clarify"
-- ውይይቱ ሲጨርስ → status:"ask_done"
-- Admin "የለም/አይ/yellem/nope/ጨረስኩ/bye" ቢል → status:"done"
-- ህግ ካልሆነ → status:"chat" + rules:[]
+======================================================
+🔑 STATUS definitions:
+======================================================
+- "discussing"  → ህግ አይደለም፣ ጨዋታ/ወይይት ብቻ
+- "clarifying"  → ያልገባ አለ — ይጠይቃል
+- "conflict"    → ተቃርኖ አለ — admin ይምረጥ
+- "confirming"  → ህጉ ገብቶታል — ያረጋግጣል (ยัง save አይደለም)
+- "saved"       → admin confirmed → save
+- "done"        → ጨርሰናል
 
-IMPORTANT: rules array ውስጥ ህጉን በሙሉ detail ጻፍ — ምሳሌ:
-"reply style: ሰው ሲያዝ 'ኦኬ ታደለ [ቁጥር] ✅' ብቻ በል"
-"ብዙ ቁጥሮች አንድ ላይ ሲመጡ ሁሉንም book_multiple አድርግ"
+IMPORTANT rules array:
+- "confirming" ላይ → rules = [ሊቀመጠው ህግ] (ብዙ detail ጋር)
+- "saved" ላይ → rules = [የተረጋገጠው ህግ]
+- "conflict" ላይ → deleted_rules = [ያሮጌው conflicting rule text ትክክለኛ] 
+- ሌሎች → rules=[], deleted_rules=[]
 
 JSON ብቻ (markdown የለ):
-{{"status":"chat","rules":[],"reply":"..."}}
-{{"status":"confirm","rules":["ህጉ እዚህ በሙሉ detail"],"reply":"..."}}
-{{"status":"saved","rules":[],"reply":"ገባኝ 👍"}}
-{{"status":"clarify","rules":[],"reply":"..."}}
-{{"status":"ask_done","rules":[],"reply":"ሌላ ነገር አለ? 😊"}}
-{{"status":"done","rules":["ህግ1","ህግ2"],"reply":"✅ ሁሉም ተቀመጠ!"}}
+{{"status":"discussing","deleted_rules":[],"rules":[],"reply":"..."}}
+{{"status":"clarifying","deleted_rules":[],"rules":[],"reply":"..."}}
+{{"status":"conflict","deleted_rules":["ያሮጌው ህግ exact text"],"rules":[],"reply":"ቀደም ሲል X ብለህ ነበር፣ አሁን Y ትላለህ — የቱ ትክክል?"}}
+{{"status":"confirming","deleted_rules":[],"rules":["ሊቀመጠው ህግ ሙሉ detail ጋር"],"reply":"ትክክል ነው? ✅ ካልህ ይቀመጣል"}}
+{{"status":"saved","deleted_rules":["ያሮጌ conflict"],"rules":["አዲሱ ህግ"],"reply":"✅ ተቀምጧል!"}}
+{{"status":"done","deleted_rules":[],"rules":[],"reply":"✅ ሁሉም ተቀምጧል! ሌላ?"}}
 
 JSON ብቻ:"""
 
-    raw = gemini_call(prompt, max_tokens=800, temperature=0.2)
+    raw = gemini_call(prompt, max_tokens=1000, temperature=0.3)
     print(f"🎓 Teach AI raw: {raw}")
     try:
         clean = re.sub(r'```(?:json)?', '', raw).strip()
-        match = re.search(r'\{.*?\}', clean, re.DOTALL)
+        match = re.search(r'\{.*\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
         print(f"❌ Teach AI parse error: {e}")
-    return {"status": "learning", "reply": "ገባኝ! ሌላ?"}
+    return {"status": "discussing", "deleted_rules": [], "rules": [], "reply": "ገባኝ! ሌሎ?"}
 
 # ==================== BOT EXECUTOR ====================
 
@@ -871,7 +904,6 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
             changed = True
 
     elif action == "update_rule":
-        # Admin group ላይ rule ሲቀይር
         rule = action_data.get("rule", "")
         if rule:
             save_admin_rule(rule)
@@ -883,7 +915,6 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
 admin_teach_sessions: dict = {}
 
 async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # DM ውስጥ ብቻ ይስራ
     if update.effective_chat.type != "private":
         return
 
@@ -894,18 +925,29 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if not context.args:
-        admin_teach_sessions[user_id] = {"active": True, "history": []}
+        # ========== /mkr ብቻ → teach mode ጀምር ==========
+        admin_teach_sessions[user_id] = {
+            "active": True,
+            "history": [],
+            "pending_rules": [],       # confirmed ግን ยัง saved አይደሉ
+            "pending_deletes": [],     # conflict ተለይቶ delete ሊሆኑ
+        }
         existing_rules = load_admin_rules()
         rules_preview = ""
         if existing_rules:
-            rules_preview = f"\n\n📌 አሁን ያሉ ህጎች ({len(existing_rules)}):\n" + "\n".join(f"- {r}" for r in existing_rules[-3:])
-            if len(existing_rules) > 3:
-                rules_preview += f"\n... እና {len(existing_rules)-3} ተጨማሪ"
+            shown = existing_rules[-5:]
+            rules_preview = f"\n\n📌 አሁን ያሉ ህጎች ({len(existing_rules)}):\n" + "\n".join(f"• {r}" for r in shown)
+            if len(existing_rules) > 5:
+                rules_preview += f"\n... እና {len(existing_rules)-5} ተጨማሪ (/mkr list ለማየት)"
         await update.message.reply_text(
-            f"📚 ዝግጁ ነኝ! አወራኝ — ሃሳብ እንለዋወጥ 🤝\nሁሉንም ነገር ልትነግረኝ ትችላለህ — reply style, አዲስ features, behavior...\n(ስትጨርስ \"ጨረስኩ\" በል){rules_preview}"
+            f"📚 ዝግጁ ነኝ! አወራኝ 🤝\n"
+            f"ሁሉንም ነገር ልትነግረኝ ትችላለህ — reply style, አዲስ features, behavior...\n"
+            f"ሳይገባኝ አልቀምጥም — እጠይቃለሁ 😊\n"
+            f"(ስትጨርስ \"ጨረስኩ\" በል){rules_preview}"
         )
         return
 
+    # ========== /mkr list ==========
     if context.args[0] == "list":
         rules = load_admin_rules()
         if not rules:
@@ -915,10 +957,12 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(text)
         return
 
+    # ========== /mkr tokens ==========
     if context.args[0] == "tokens":
         await update.message.reply_text(build_token_report())
         return
 
+    # ========== /mkr reset ==========
     if context.args[0] == "reset":
         if len(context.args) == 1 or context.args[1].lower() == "all":
             delete_all_admin_rules()
@@ -945,12 +989,13 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             cur.close()
             conn.close()
-            deleted = "\n".join(f"- {r}" for r in to_delete)
+            deleted = "\n".join(f"• {r}" for r in to_delete)
             await update.message.reply_text(f"🗑️ ተሰርዘዋል:\n{deleted}")
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {e}")
         return
 
+    # ========== /mkr <direct rule> ==========
     rule = " ".join(context.args)
     save_admin_rule(rule)
     await update.message.reply_text(f"✅ ተማርኩ!\n📌 \"{rule}\"")
@@ -958,7 +1003,6 @@ async def teach_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== BOT HANDLERS ====================
 
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Group ወይም DM ውስጥ ይስራ — ግን admin ብቻ
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
         return
@@ -970,9 +1014,7 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_data(data)
     await update.message.reply_text("✅ ሎተሪ ጀምሯል!")
 
-
 async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # DM ውስጥ ብቻ
     if update.effective_chat.type != "private":
         return
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -1003,7 +1045,6 @@ async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Slot አልተገኘም")
 
-
 async def update_lottery_message(bot: Bot, data: dict):
     if data.get("lottery_message_id") and data.get("chat_id"):
         try:
@@ -1015,7 +1056,6 @@ async def update_lottery_message(bot: Bot, data: dict):
         except Exception as e:
             print(f"Message update error: {e}")
 
-
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.photo:
         return
@@ -1024,7 +1064,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = update.effective_user.first_name or "ተጠቃሚ"
     is_private = update.effective_chat.type == "private"
 
-    # ==================== TEACH MODE PHOTO (DM only) ====================
+    # ========== TEACH MODE PHOTO ==========
     if is_private and user_id == ADMIN_TELEGRAM_ID and user_id in admin_teach_sessions and admin_teach_sessions[user_id]["active"]:
         try:
             photo     = update.message.photo[-1]
@@ -1037,7 +1077,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
                 for m in session["history"]
             )
-            existing_rules_text = "\n".join(f"- {r}" for r in existing_rules) if existing_rules else "ምንም የለም"
+            existing_rules_text = "\n".join(f"{i+1}. {r}" for i, r in enumerate(existing_rules)) if existing_rules else "ምንም የለም"
 
             key    = get_next_gemini_key()
             client = genai.Client(api_key=key)
@@ -1045,47 +1085,58 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 model="gemini-2.5-flash-lite",
                 contents=[
                     types.Part.from_bytes(data=bytes(img_bytes), mime_type="image/jpeg"),
-                    f"""አንተ AI assistant ነህ። ልክ እንደ Claude/Gemini app። Admin photo ልኮልሃል።
+                    f"""አንተ AI assistant ነህ — ሙሉ ኃይልህን ተጠቀም። Admin photo ልኮልሃል።
 
-ፎቶውን ተመልከትና ልክ እንደ ወዳጅ ሆነህ ምላሽ ስጥ። ምን እንደሚያሳይ ተናገር።
+ፎቶውን ተመልከትና ምን እንደሚያሳይ ተናገር።
+ህግ ካለ → rules ውስጥ አስቀምጥ — ህግ ካልሆነ rules=[]።
 
-ውይይት ታሪክ:
+ያሉ ህጎች:
+{existing_rules_text}
+
+ውይይት:
 {history_text}
 
-አሁን ያሉ ህጎች: {existing_rules_text}
-
-ህግ/መመሪያ ካለ rules ውስጥ አስቀምጥ — ህግ ካልሆነ rules=[] ብቻ።
-casual አማርኛ። markdown የለ።
-
 JSON ብቻ:
-{{"status":"chat","rules":[],"reply":"..."}}
-{{"status":"confirm","rules":["ህጉ"],"reply":"..."}}
+{{"status":"discussing","deleted_rules":[],"rules":[],"reply":"..."}}
+{{"status":"confirming","deleted_rules":[],"rules":["ህጉ"],"reply":"ትክክል ነው?"}}
 
 JSON ብቻ:"""
                 ],
-                config=types.GenerateContentConfig(max_output_tokens=600, temperature=0.4)
+                config=types.GenerateContentConfig(max_output_tokens=600, temperature=0.3)
             )
             raw   = response.text.strip()
             clean = re.sub(r'```(?:json)?', '', raw).strip()
             match = re.search(r'\{.*?\}', clean, re.DOTALL)
-            result = json.loads(match.group()) if match else {"status": "chat", "rules": [], "reply": raw}
+            result = json.loads(match.group()) if match else {"status": "discussing", "rules": [], "deleted_rules": [], "reply": raw}
 
-            reply     = result.get("reply", "ፎቶ ደረሰኝ 👍")
-            new_rules = result.get("rules", [])
+            reply        = result.get("reply", "ፎቶ ደረሰኝ 👍")
+            new_rules    = result.get("rules", [])
+            del_rules    = result.get("deleted_rules", [])
+            status       = result.get("status", "discussing")
+
             session["history"].append({"role": "user", "content": "[photo]"})
             session["history"].append({"role": "assistant", "content": reply})
-            for rule in new_rules:
-                if rule:
-                    save_admin_rule(rule)
+
+            # Only save on "saved" status
+            if status == "saved":
+                for r in del_rules:
+                    if r:
+                        delete_specific_rule(r)
+                for r in new_rules:
+                    if r:
+                        save_admin_rule(r)
+            elif status == "confirming":
+                session["pending_rules"]  = new_rules
+                session["pending_deletes"] = del_rules
+
             await update.message.reply_text(reply)
         except Exception as e:
             print(f"❌ teach photo error: {e}")
             await update.message.reply_text("❌ ፎቶ ማንበብ አልተቻለም።")
         return
 
-    # ==================== PAYMENT PHOTO ====================
+    # ========== PAYMENT PHOTO ==========
     await update.message.reply_text("⏳ Screenshot እየተመረመረ ነው...")
-
     try:
         photo     = update.message.photo[-1]
         file      = await context.bot.get_file(photo.file_id)
@@ -1119,47 +1170,36 @@ JSON ብቻ:"""
             await update.message.reply_text(
                 f"✅ Screenshot ተቀብዬአለሁ!\nRef: {ref} | {bank}\n⏳ SMS confirmation እየጠበቅን ነው..."
             )
-
     except Exception as e:
         print(f"❌ handle_photo error: {e}")
         await update.message.reply_text("❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።")
 
-
 async def handle_sms_webhook(sms_text: str, bot: Bot):
     print(f"📱 SMS received: {sms_text[:100]}")
-
-    info = groq_extract_payment_from_text(sms_text)
+    info   = groq_extract_payment_from_text(sms_text)
     print(f"📱 SMS payment info: {info}")
-
     refs   = info.get("refs") or []
     amount = info.get("amount") or 0.0
     bank   = info.get("bank") or "UNKNOWN"
-
     if not refs:
         print("❌ SMS: ref ማግኘት አልተቻለም")
         return
-
     matched_ref     = None
     matched_payment = None
     data            = load_data()
-
     for ref in refs:
         if is_ref_used(ref):
             continue
-
         existing  = get_payment_by_ref(ref)
         user_id   = existing["user_id"]     if existing else None
         user_name = existing["user_name"]   if existing else "Unknown"
         slot_num  = existing["slot_number"] if existing else None
-
         upsert_payment(ref, user_id or 0, user_name, amount, bank, sms_ok=True, slot_number=slot_num)
-
         payment = get_payment_by_ref(ref)
         if payment and payment["photo_ok"] and payment["sms_ok"]:
             matched_ref     = ref
             matched_payment = payment
             break
-
     if matched_ref and matched_payment:
         await handle_payment_match(matched_ref, matched_payment, bot, data)
     else:
@@ -1171,7 +1211,6 @@ async def handle_sms_webhook(sms_text: str, bot: Bot):
                     text="📱 SMS ተቀብዬአለሁ!\n⏳ Screenshot እስካልከ ድረስ እጠብቃለሁ።"
                 )
                 break
-
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -1188,21 +1227,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = admin_teach_sessions[user_id]
         session["history"].append({"role": "user", "content": raw_text})
         existing_rules = load_admin_rules()
-        result    = ai_teach_brain(session["history"], raw_text, existing_rules)
-        reply     = result.get("reply", "ገባኝ!")
-        status    = result.get("status", "chat")
-        new_rules = result.get("rules", [])
+
+        result        = ai_teach_brain(session["history"], raw_text, existing_rules)
+        reply         = result.get("reply", "ገባኝ!")
+        status        = result.get("status", "discussing")
+        new_rules     = result.get("rules", [])
+        del_rules     = result.get("deleted_rules", [])
+
         session["history"].append({"role": "assistant", "content": reply})
-        if status in ("confirm", "saved", "chat", "ask_done"):
-            for rule in new_rules:
-                if rule:
-                    save_admin_rule(rule)
-        if status == "done":
-            for rule in new_rules:
-                if rule:
-                    save_admin_rule(rule)
+
+        # ====== Status ላይ በመመርኮዝ ምን ይደረጋል ======
+        if status == "confirming":
+            # ህጉ ገብቷል ግን ยัง save አይደለም — pending ያድርግ
+            session["pending_rules"]   = new_rules
+            session["pending_deletes"] = del_rules
+            print(f"📝 Pending rules: {new_rules}")
+
+        elif status == "saved":
+            # Admin confirmed (ok/አዎ/yes) → አሁን save
+            # ከ pending ወይም ከ result — ሁለቱንም check
+            to_save   = new_rules or session.get("pending_rules", [])
+            to_delete = del_rules or session.get("pending_deletes", [])
+
+            for r in to_delete:
+                if r:
+                    delete_specific_rule(r)
+                    print(f"🗑️ Deleted conflicting rule: {r[:60]}")
+
+            for r in to_save:
+                if r:
+                    save_admin_rule(r)
+                    print(f"✅ Saved rule: {r[:60]}")
+
+            session["pending_rules"]   = []
+            session["pending_deletes"] = []
+
+        elif status == "conflict":
+            # Conflict ተለይቷል — pending delete ያድርግ
+            session["pending_deletes"] = del_rules
+            print(f"⚠️ Conflict detected: {del_rules}")
+
+        elif status == "done":
+            # Session አለቀ
+            to_save   = new_rules or session.get("pending_rules", [])
+            to_delete = del_rules or session.get("pending_deletes", [])
+            for r in to_delete:
+                if r:
+                    delete_specific_rule(r)
+            for r in to_save:
+                if r:
+                    save_admin_rule(r)
             admin_teach_sessions[user_id]["active"] = False
-            print(f"📚 Teaching done. {len(new_rules)} rules saved.")
+            print(f"📚 Teaching session done.")
+
         await update.message.reply_text(reply)
         return
 
@@ -1220,16 +1297,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         result = execute_action(action_data, user_id, data)
-
         if result["changed"]:
             save_data(result["data"])
             await update_lottery_message(context.bot, result["data"])
-
         if result["reply"]:
             await update.message.reply_text(result["reply"])
         return
 
-    # ==================== REGULAR USER (Group or DM) ====================
+    # ==================== REGULAR USER ====================
     data       = load_data()
     full_state = build_full_state_for_ai(data)
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
@@ -1242,7 +1317,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     result = execute_action(action_data, user_id, data)
-
     if result["changed"]:
         save_data(result["data"])
         await update_lottery_message(context.bot, result["data"])
@@ -1267,21 +1341,18 @@ class SMSWebhookHandler(BaseHTTPRequestHandler):
             length   = int(self.headers.get("Content-Length", 0))
             raw_body = self.rfile.read(length).decode("utf-8", errors="ignore")
             print(f"📥 Webhook POST: {raw_body[:200]}")
-
             sms_text = raw_body
             try:
                 parsed = json.loads(raw_body)
                 sms_text = parsed.get("sms") or parsed.get("text") or parsed.get("message") or raw_body
             except Exception:
                 pass
-
             if sms_text and SMSWebhookHandler.bot_instance:
                 import asyncio
                 asyncio.run_coroutine_threadsafe(
                     handle_sms_webhook(sms_text, SMSWebhookHandler.bot_instance),
                     loop=asyncio.get_event_loop()
                 )
-
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
