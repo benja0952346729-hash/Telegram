@@ -416,16 +416,18 @@ Bot executor JSON action ይፈጽማል።
 
 ========= ህጎች =========
 1. አንድ ቁጥር ብቻ ሲጽፍ → book_full ወይም book_half_p1
-2. ሁለትና በላይ ቁጥሮች ሲጽፍ → ሁሌ book_multiple ተጠቀም (bookings array ውስጥ ሁሉንም ጨምር)
-   ምሳሌ: "21 31" → {{"action":"book_multiple","bookings":[{{"number":21,"type":"full"}},{{"number":31,"type":"full"}}],...}}
-   ምሳሌ: "21 31 41ግማሽ" → 21=full, 31=full, 41=half → ሁሉም bookings ውስጥ
+2. ሁለትና በላይ ቁጥሮች ሲጽፍ → ሁሌ book_multiple (bookings array ውስጥ ሁሉንም ጨምር)
+   ምሳሌ: "21 31" → {{"action":"book_multiple","bookings":[{{"number":21,"type":"full"}},{{"number":31,"type":"full"}}],"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
+   ምሳሌ: "81 86" → {{"action":"book_multiple","bookings":[{{"number":81,"type":"full"}},{{"number":86,"type":"full"}}],"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
+   ምሳሌ: "16+ 21+" → {{"action":"book_multiple","bookings":[{{"number":16,"type":"half"}},{{"number":21,"type":"half"}}],"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
    ግልጽ ካልሆነ → ask
-3. የተያዘ slot → "ተቀድመሃል ቤተሰብ 🙏"
-4. እራሱ ያዘ → "ይዥሄልሃለው ቤተሰብ 🙏"
-5. ቁጥር አውጣ/ቀይር → የራሱን ብቻ
-6. ክፍያ ሲጠይቅ → የጠቀሰውን bank ብቻ ላክ
-7. ክፍያ ማስረጃ → "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
-8. book actions reply → "እሺ ገቢ 🙏"
+3. "ቁጥር አለ?" / "ነፃ ቁጥር አለ?" / "kutr ale?" ማለት → ነፃ slots ዝርዝር አሳይ → action:reply
+4. የተያዘ slot → "ተቀድመሃል ቤተሰብ 🙏"
+5. እራሱ ያዘ → "ይዥሄልሃለው ቤተሰብ 🙏"
+6. ቁጥር አውጣ/ቀይር → የራሱን ብቻ
+7. ክፍያ ሲጠይቅ → የጠቀሰውን bank ብቻ ላክ
+8. ክፍያ ማስረጃ → "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
+9. book actions reply → "እሺ ገቢ 🙏"
 
 ========= JSON OUTPUT =========
 {{"action":"book_full","number":6,"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
