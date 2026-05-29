@@ -415,15 +415,17 @@ Bot executor JSON action ይፈጽማል።
 መልእክት: "{user_message}"
 
 ========= ህጎች =========
-1. ቁጥር ሲጽፍ → ቀጥታ book (ምልክቶች: "06"=ሙሉ, "21+"/"21ግማሽ"=ግማሽ)
-2. ብዙ ቁጥር ("21 31 41ግማሽ") → ግልጽ ከሆነ ቀጥታ book_multiple
-   ግልጽ ካልሆነ → ask (ምሳሌ: "21 31 41 ሁሉም ግማሽ ነው? / 41 ብቻ ግማሽ?")
+1. አንድ ቁጥር ብቻ ሲጽፍ → book_full ወይም book_half_p1
+2. ሁለትና በላይ ቁጥሮች ሲጽፍ → ሁሌ book_multiple ተጠቀም (bookings array ውስጥ ሁሉንም ጨምር)
+   ምሳሌ: "21 31" → {{"action":"book_multiple","bookings":[{{"number":21,"type":"full"}},{{"number":31,"type":"full"}}],...}}
+   ምሳሌ: "21 31 41ግማሽ" → 21=full, 31=full, 41=half → ሁሉም bookings ውስጥ
+   ግልጽ ካልሆነ → ask
 3. የተያዘ slot → "ተቀድመሃል ቤተሰብ 🙏"
 4. እራሱ ያዘ → "ይዥሄልሃለው ቤተሰብ 🙏"
 5. ቁጥር አውጣ/ቀይር → የራሱን ብቻ
-6. ክፍያ ሲጠይቅ → የጠቀሰውን bank ብቻ ላክ (CBE ካለ CBE ብቻ)
+6. ክፍያ ሲጠይቅ → የጠቀሰውን bank ብቻ ላክ
 7. ክፍያ ማስረጃ → "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
-8. "እሺ ገቢ 🙏" reply ለ book actions
+8. book actions reply → "እሺ ገቢ 🙏"
 
 ========= JSON OUTPUT =========
 {{"action":"book_full","number":6,"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
