@@ -307,7 +307,37 @@ def build_full_state_for_ai(data: dict) -> str:
                 lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ግማሽ ሙሉ | p1={slot['p1_name']} (ID:{slot['p1_id']}) {p1_paid} | p2={slot['p2_name']} (ID:{slot['p2_id']}) {p2_paid}")
     filled  = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
     summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
-    return summary + "\n".join(lines)
+    state   = summary + "\n".join(lines)
+
+    # ==================== PAYMENT INFO ====================
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT 50")
+        payments = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if payments:
+            total_approved = sum(p["amount"] for p in payments if p["status"] == "approved" and p["amount"])
+            total_pending  = sum(p["amount"] for p in payments if p["status"] == "pending" and p["amount"])
+            pay_lines = [
+                f"\n--- Payment Summary ---",
+                f"✅ Approved ጠቅላላ: {total_approved:.0f} ብር",
+                f"⏳ Pending ጠቅላላ: {total_pending:.0f} ብር",
+                f"\n--- Payment Details (ቅርብ 50) ---"
+            ]
+            for p in payments:
+                pay_lines.append(
+                    f"User:{p['user_name']} (ID:{p['user_id']}) | Ref:{p['ref']} | "
+                    f"{p['amount']}ብር | {p['bank']} | {p['status']} | "
+                    f"photo:{'✅' if p['photo_ok'] else '❌'} sms:{'✅' if p['sms_ok'] else '❌'}"
+                )
+            state += "\n" + "\n".join(pay_lines)
+    except Exception as e:
+        print(f"❌ payment state error: {e}")
+
+    return state
 
 # ==================== GEMINI AI CALL ====================
 
