@@ -51,7 +51,15 @@ CBE 1000641057146 biniyam dawit
 ዳሽን  5389857825011
 ቴሌ ብር 0952346729"""
 
-# ==================== DATABASE (NEON POSTGRES) ====================
+# ==================== PAYMENT ACCOUNTS ====================
+PAYMENT_ACCOUNTS = {
+    "cbe":    "CBE 1000641057146 biniyam dawit",
+    "awash":  "አዋሽ 01335630641400",
+    "dashen": "ዳሽን 5389857825011",
+    "telebirr": "ቴሌ ብር 0952346729",
+}
+
+# ==================== DATABASE ====================
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -70,6 +78,15 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS admin_chat_history (
                 id         SERIAL PRIMARY KEY,
+                role       TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_chat_history (
+                id         SERIAL PRIMARY KEY,
+                user_id    BIGINT NOT NULL,
                 role       TEXT NOT NULL,
                 content    TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW()
@@ -115,17 +132,15 @@ def delete_all_admin_rules():
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ All rules deleted")
     except Exception as e:
         print(f"❌ delete_all_admin_rules error: {e}")
 
-def load_admin_chat_history(limit: int = 30) -> list:
+def load_admin_chat_history(limit: int = 20) -> list:
     try:
         conn = get_db()
         cur  = conn.cursor()
         cur.execute(
-            "SELECT role, content FROM admin_chat_history ORDER BY id DESC LIMIT %s",
-            (limit,)
+            "SELECT role, content FROM admin_chat_history ORDER BY id DESC LIMIT %s", (limit,)
         )
         rows = cur.fetchall()
         cur.close()
@@ -140,8 +155,7 @@ def save_admin_chat_message(role: str, content: str):
         conn = get_db()
         cur  = conn.cursor()
         cur.execute(
-            "INSERT INTO admin_chat_history (role, content) VALUES (%s, %s)",
-            (role, content)
+            "INSERT INTO admin_chat_history (role, content) VALUES (%s, %s)", (role, content)
         )
         conn.commit()
         cur.close()
@@ -157,9 +171,39 @@ def clear_admin_chat_history():
         conn.commit()
         cur.close()
         conn.close()
-        print("✅ Chat history cleared")
     except Exception as e:
         print(f"❌ clear_admin_chat_history error: {e}")
+
+# ---- User chat history (per user, separate) ----
+def load_user_chat_history(user_id: int, limit: int = 10) -> list:
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT role, content FROM user_chat_history WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+            (user_id, limit)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    except Exception as e:
+        print(f"❌ load_user_chat_history error: {e}")
+        return []
+
+def save_user_chat_message(user_id: int, role: str, content: str):
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO user_chat_history (user_id, role, content) VALUES (%s, %s, %s)",
+            (user_id, role, content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"❌ save_user_chat_message error: {e}")
 
 def build_admin_rules_text() -> str:
     rules = load_admin_rules()
@@ -236,33 +280,44 @@ def _format_first_line(num: int, slot: dict) -> str:
 def build_full_message(data: dict) -> str:
     return LOTTERY_TEMPLATE.format(numbers=build_numbers_text(data))
 
-def build_full_state_for_ai(data: dict) -> str:
-    lines = []
+def build_short_state(data: dict) -> str:
+    """Token ለመቆጠብ አጭር state"""
+    free_slots  = []
+    half_open   = []
+    booked_info = []
+
     for slot_id, slot in data["slots"].items():
         nums = slot["numbers"]
-        t    = slot["type"]
-        if t is None:
-            lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ነፃ")
-        elif t == "full":
-            paid = "ከፍሏል ✅" if slot["p1_paid"] else "ገና አልከፈለም ⏳"
-            lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ሙሉ | {slot['p1_name']} (ID:{slot['p1_id']}) | {paid}")
-        elif t == "half":
+        rng  = f"{nums[0]}-{nums[-1]}"
+        if slot["type"] is None:
+            free_slots.append(rng)
+        elif slot["type"] == "half" and slot["p2_id"] is None:
             p1_paid = "✅" if slot["p1_paid"] else "⏳"
-            if slot["p2_id"] is None:
-                lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ግማሽ | p1={slot['p1_name']} (ID:{slot['p1_id']}) {p1_paid} | p2=ክፍት")
-            else:
-                p2_paid = "✅" if slot["p2_paid"] else "⏳"
-                lines.append(f"Slot {slot_id} ({nums[0]}-{nums[-1]}): ግማሽ ሙሉ | p1={slot['p1_name']} (ID:{slot['p1_id']}) {p1_paid} | p2={slot['p2_name']} (ID:{slot['p2_id']}) {p2_paid}")
-    filled  = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
-    summary = f"\n--- ጠቅላላ: {filled}/20 slots ሞልቷል ---\n"
-    return summary + "\n".join(lines)
+            half_open.append(f"{rng}({slot['p1_name']}{p1_paid}+ክፍት)")
+        elif slot["type"] == "full":
+            paid = "✅" if slot["p1_paid"] else "⏳"
+            booked_info.append(f"{rng}:{slot['p1_name']}(ID:{slot['p1_id']}){paid}")
+        elif slot["type"] == "half" and slot["p2_id"] is not None:
+            p1p = "✅" if slot["p1_paid"] else "⏳"
+            p2p = "✅" if slot["p2_paid"] else "⏳"
+            booked_info.append(f"{rng}:{slot['p1_name']}(ID:{slot['p1_id']}){p1p}+{slot['p2_name']}(ID:{slot['p2_id']}){p2p}")
+
+    filled = sum(1 for s in data["slots"].values() if is_slot_full_booked(s))
+    lines  = [f"ጠቅላላ: {filled}/20 ሞልቷል"]
+    if free_slots:
+        lines.append(f"ነፃ slots: {', '.join(free_slots)}")
+    if half_open:
+        lines.append(f"ግማሽ ክፍት: {', '.join(half_open)}")
+    if booked_info:
+        lines.append(f"የተያዙ: {' | '.join(booked_info)}")
+    return "\n".join(lines)
 
 # ==================== GEMINI AI CALL ====================
 
-def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) -> str:
-    for attempt in range(2):
+def gemini_call(prompt: str, max_tokens: int = 300, temperature: float = 0.1) -> str:
+    for attempt in range(len(GEMINI_KEYS)):
         key         = get_next_gemini_key()
-        key_preview = key[:8] + "..." if key else "None"
+        key_preview = key[:8] + "..."
         try:
             client   = genai.Client(api_key=key)
             response = client.models.generate_content(
@@ -277,146 +332,122 @@ def gemini_call(prompt: str, max_tokens: int = 500, temperature: float = 0.2) ->
             return response.text.strip()
         except Exception as e:
             err = str(e)
-            if "API_KEY_INVALID" in err or "API key not valid" in err:
-                reason = "❌ API Key ትክክል አይደለም"
-            elif "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
-                reason = "❌ Quota ተጠቀሰ"
-            elif "PERMISSION_DENIED" in err:
-                reason = "❌ Permission የለም"
-            elif "UNAVAILABLE" in err or "503" in err:
-                reason = "❌ Gemini server አይሰራም"
-            elif "timeout" in err.lower():
-                reason = "❌ Timeout"
-            else:
-                reason = f"❌ Error: {err}"
-            print(f"⚠️ Gemini attempt {attempt+1} (key: {key_preview}): {reason}")
-    print("🔴 Gemini ሙሉ በሙሉ አልሰራም")
+            if "RESOURCE_EXHAUSTED" in err or "quota" in err.lower() or "429" in err:
+                print(f"⚠️ Quota exhausted key {key_preview}, trying next...")
+                continue
+            print(f"⚠️ Gemini error (key: {key_preview}): {err}")
+    print("🔴 ሁሉም Gemini keys quota ተጠቀሱ")
     return ""
 
 # ==================== ADMIN PRIVATE GEMINI CHAT ====================
 
 def admin_gemini_chat(user_message: str, data: dict) -> str:
-    """Admin DM ውስጥ ሙሉ context ያለው Gemini ውይይት"""
-    full_state   = build_full_state_for_ai(data)
-    admin_rules  = build_admin_rules_text()
-    history      = load_admin_chat_history(limit=30)
+    full_state  = build_short_state(data)
+    admin_rules = build_admin_rules_text()
+    history     = load_admin_chat_history(limit=15)
 
     history_text = "\n".join(
-        f"{'Admin' if m['role']=='user' else 'Gemini'}: {m['content']}"
+        f"{'Admin' if m['role']=='user' else 'Bot'}: {m['content']}"
         for m in history
-    ) if history else "(ምንም ታሪክ የለም)"
+    ) if history else ""
 
-    prompt = f"""አንተ ሙሉ የሎተሪ ስርዓት Gemini ነህ። Admin ጋር በ private ታወራለህ።
+    prompt = f"""አንተ ሙሉ የሎተሪ ስርዓት Gemini ነህ። Admin ጋር private ታወራለህ።
 ሁሉንም ታወቃለህ — slots፣ ተጫዋቾች፣ ክፍያ፣ ህጎች።
 
-========= የሎተሪ ሙሉ ሁኔታ =========
+የሎተሪ ሁኔታ:
 {full_state}
 
-========= የተመዘገቡ ህጎች =========
-{admin_rules if admin_rules else "ምንም ህግ አልተመዘገበም"}
+የተመዘገቡ ህጎች: {admin_rules if admin_rules else "ምንም"}
 
-========= የውይይት ታሪክ =========
+ታሪክ:
 {history_text}
 
-========= Admin አዲስ መልእክት =========
-{user_message}
+Admin: {user_message}
 
-========= መመሪያ =========
-- አማርኛ ብቻ መልስ
-- Admin ህግ ሲጨምር → [SAVE_RULE: ህጉን እዚህ ፃፍ] format ጨምር
-- Admin ህጎች እንዲሰረዙ ከፈለገ → [DELETE_RULES] ፃፍ  
-- ሁሉንም ጥያቄ ከ data ጋር መልስ
-- አጭር፣ ግልጽ፣ ጠቃሚ መልስ ስጥ"""
+መመሪያ:
+- አማርኛ ብቻ
+- ህግ ሲጨምር → [SAVE_RULE: ህጉን ፃፍ]
+- ህጎች ሲሰረዙ → [DELETE_RULES]
+- አጭር፣ ግልጽ መልስ"""
 
-    return gemini_call(prompt, max_tokens=600, temperature=0.3)
+    return gemini_call(prompt, max_tokens=400, temperature=0.3)
 
+def process_admin_gemini_response(response: str) -> tuple:
+    new_rules  = []
+    delete_all = False
+    clean      = response
 
-def process_admin_gemini_response(response: str) -> tuple[str, list, bool]:
-    """Gemini response ውስጥ SAVE_RULE እና DELETE_RULES ያውጣ"""
-    new_rules   = []
-    delete_all  = False
-    clean_reply = response
+    for rule in re.findall(r'\[SAVE_RULE:\s*(.+?)\]', response):
+        if rule.strip():
+            new_rules.append(rule.strip())
+    clean = re.sub(r'\[SAVE_RULE:\s*.+?\]', '', clean).strip()
 
-    # SAVE_RULE ፈልግ
-    save_matches = re.findall(r'\[SAVE_RULE:\s*(.+?)\]', response)
-    for rule in save_matches:
-        rule = rule.strip()
-        if rule:
-            new_rules.append(rule)
-    clean_reply = re.sub(r'\[SAVE_RULE:\s*.+?\]', '', clean_reply).strip()
-
-    # DELETE_RULES ፈልግ
     if '[DELETE_RULES]' in response:
-        delete_all  = True
-        clean_reply = clean_reply.replace('[DELETE_RULES]', '').strip()
+        delete_all = True
+        clean = clean.replace('[DELETE_RULES]', '').strip()
 
-    return clean_reply, new_rules, delete_all
+    return clean, new_rules, delete_all
 
-# ==================== GROUP AI BRAIN ====================
+# ==================== GROUP AI BRAIN (Gemini) ====================
 
-def ai_brain(user_message: str, user_id: int, user_name: str, full_state: str) -> dict:
+def ai_brain(user_message: str, user_id: int, user_name: str, data: dict) -> dict:
+    """ሁሉም logic Gemini ያደርጋል — JSON action ይመልሳል"""
+    full_state  = build_short_state(data)
     admin_rules = build_admin_rules_text()
-    prompt = f"""አንተ የሎተሪ ስርዓት AI brain ነህ። Bot worker ነው የሚያስፈጽመው።
-ተጫዋቾች ብቻ ናቸው የሚናገሩህ — group ውስጥ።
 
-========= የሎተሪ ህጎች =========
-- 20 slots (1-20), እያንዳንዱ slot 5 ቁጥሮች (slot1=1-5, slot2=6-10, ... slot20=96-100)
-- ሙሉ = 400ብር (አንድ ሰው), ግማሽ = 200ብር (ሁለት ሰዎች)
-- ሽልማት: 1ኛ=5000ብር, 2ኛ=1000ብር, 3ኛ=400ብር
-- ክፍያ: CBE 1000641057146, አዋሽ 01335630641400, ዳሽን 5389857825011, ቴሌ 0952346729
-- ተጫዋች የራሱን ቁጥር ብቻ ሰርዝ/ቀይር ይችላል
+    # Per-user history (አጭር)
+    user_history = load_user_chat_history(user_id, limit=6)
+    history_text = "\n".join(
+        f"{'User' if m['role']=='user' else 'Bot'}: {m['content']}"
+        for m in user_history
+    ) if user_history else ""
 
-========= ቁጥር መያዝ ምልክቶች =========
-ሙሉ (default): "06", "36ሙሉ"
-ግማሽ: "21+", "21ግማሽ", "21half", "21 200"
-ብዙ ቁጥር: "10 16 21ግማሽ" → 10=ሙሉ, 16=ሙሉ, 21=ግማሽ
+    prompt = f"""አንተ የሎተሪ bot Gemini brain ነህ። Group ውስጥ ተጫዋቾችን ታስተናግዳለህ።
+Bot executor JSON action ይፈጽማል።
 
-========= የአሁን ሎተሪ ሁኔታ =========
+የሎተሪ ሁኔታ:
 {full_state}
 {admin_rules}
-========= ተጠቃሚ =========
-User ID: {user_id}
-User Name: {user_name}
+ክፍያ accounts: CBE=1000641057146 | አዋሽ=01335630641400 | ዳሽን=5389857825011 | ቴሌ=0952346729
+
+ተጠቃሚ: {user_name} (ID:{user_id})
+ታሪክ: {history_text}
 መልእክት: "{user_message}"
 
-========= ACTION ህጎች =========
-1. ቁጥር ሲጽፍ → ቀጥታ book → reply: "እሺ ገቢ 🙏"
-2. ውስብስብ/ግልጽ ካልሆነ → ጥያቄ ጠይቅ
-3. የተያዘ slot ሌላ ሰው ሲጠራ → reply: "ተቀድመሃል ቤተሰብ 🙏"
-4. ሰው ቀድሞ የያዘውን እንደገና ሲጠራ → reply: "ይዥሄልሃለው ቤተሰብ 🙏"
-5. ሰው "ያዝኩ" ቢል ግን ያልያዘ → "አይደለም፣ [ስም] [slot] ይዞታል — ከላይ ተመልከት"
-6. ቁጥር አውጣ → cancel (የራሱን ብቻ)
-7. ቁጥር ቀይር (X በ Y) → cancel_and_rebook (የራሱን ብቻ)
-8. ክፍያ ማስረጃ → reply: "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
-9. ሎተሪ ጥያቄ → AI ይመልሳል
-10. Admin actions (mark_paid ወዘተ) → ተጫዋች ሊያደርግ አይችልም
+========= ህጎች =========
+1. ቁጥር ሲጽፍ → ቀጥታ book (ምልክቶች: "06"=ሙሉ, "21+"/"21ግማሽ"=ግማሽ)
+2. ብዙ ቁጥር ("21 31 41ግማሽ") → ግልጽ ከሆነ ቀጥታ book_multiple
+   ግልጽ ካልሆነ → ask (ምሳሌ: "21 31 41 ሁሉም ግማሽ ነው? / 41 ብቻ ግማሽ?")
+3. የተያዘ slot → "ተቀድመሃል ቤተሰብ 🙏"
+4. እራሱ ያዘ → "ይዥሄልሃለው ቤተሰብ 🙏"
+5. ቁጥር አውጣ/ቀይር → የራሱን ብቻ
+6. ክፍያ ሲጠይቅ → የጠቀሰውን bank ብቻ ላክ (CBE ካለ CBE ብቻ)
+7. ክፍያ ማስረጃ → "ተቀብዬአለሁ ✅ Admin ያረጋግጣል"
+8. "እሺ ገቢ 🙏" reply ለ book actions
 
-========= SECURITY =========
-- ተጫዋች የሌላ ሰው data ሊቀይር አይችልም
-- JSON format ሳይሰብር ሁሌ ትክክለኛ action ብቻ
-
-========= OUTPUT FORMAT (JSON ብቻ) =========
-{{"action":"book_full","number":6,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
-{{"action":"book_half_p1","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
-{{"action":"book_half_p2","number":21,"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
-{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"አበበ","reply":"እሺ ገቢ 🙏"}}
+========= JSON OUTPUT =========
+{{"action":"book_full","number":6,"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p1","number":21,"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_half_p2","number":21,"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
+{{"action":"book_multiple","bookings":[{{"number":10,"type":"full"}},{{"number":21,"type":"half"}}],"name":"{user_name}","reply":"እሺ ገቢ 🙏"}}
 {{"action":"cancel","number":6,"reply":"✅ ተሰርዟል።"}}
-{{"action":"cancel_and_rebook","cancel_number":6,"book_number":11,"book_type":"full","name":"አበበ","reply":"✅ ተቀይሯል።"}}
-{{"action":"mark_paid","number":6,"which":1,"reply":"✅ ክፍያ ተረጋግጧል!"}}
+{{"action":"cancel_and_rebook","cancel_number":6,"book_number":11,"book_type":"full","name":"{user_name}","reply":"✅ ተቀይሯል።"}}
+{{"action":"mark_paid","number":6,"which":1,"reply":"✅"}}
 {{"action":"reply","reply":"..."}}
 {{"action":"ask","reply":"..."}}
 
-አሁን JSON ብቻ:"""
+JSON ብቻ:"""
 
-    raw = gemini_call(prompt, max_tokens=400, temperature=0.1)
-    print(f"🧠 AI Brain raw: {raw}")
+    raw = gemini_call(prompt, max_tokens=250, temperature=0.1)
+    print(f"🧠 AI raw: {raw}")
+
     try:
         clean = re.sub(r'```(?:json)?', '', raw).strip()
         match = re.search(r'\{.*?\}', clean, re.DOTALL)
         if match:
             return json.loads(match.group())
     except Exception as e:
-        print(f"❌ AI Brain parse error: {e}")
+        print(f"❌ AI parse error: {e}")
     return {"action": "reply", "reply": "❌ ጊዜያዊ ችግር አለ። ቆይተህ ሞክር።"}
 
 # ==================== BOT EXECUTOR ====================
@@ -556,7 +587,7 @@ def execute_action(action_data: dict, user_id: int, data: dict) -> dict:
 
 async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        await update.message.reply_text("❌ ይህ command ለ admin ብቻ ነው።")
+        await update.message.reply_text("❌ Admin ብቻ።")
         return
     data = load_data()
     data["slots"] = {str(i): make_empty_slot(i) for i in range(1, 21)}
@@ -565,7 +596,6 @@ async def start_lottery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["chat_id"]            = update.effective_chat.id
     save_data(data)
     await update.message.reply_text("✅ ሎተሪ ጀምሯል!")
-
 
 async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
@@ -596,24 +626,21 @@ async def mark_paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Slot አልተገኘም")
 
-
-async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_TELEGRAM_ID:
-        return
-    clear_admin_chat_history()
-    await update.message.reply_text("🗑️ የውይይት ታሪክ ተሰርዟል።")
-
-
 async def rules_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_TELEGRAM_ID:
         return
     rules = load_admin_rules()
     if not rules:
-        await update.message.reply_text("📚 እስካሁን ምንም ህግ አልተመዘገበም።")
+        await update.message.reply_text("📚 ምንም ህግ የለም።")
     else:
-        text = "📚 የተመዘገቡ ህጎች:\n\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
+        text = "📚 ህጎች:\n\n" + "\n".join(f"{i+1}. {r}" for i, r in enumerate(rules))
         await update.message.reply_text(text)
 
+async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_TELEGRAM_ID:
+        return
+    clear_admin_chat_history()
+    await update.message.reply_text("🗑️ ታሪክ ተሰርዟል።")
 
 async def update_lottery_message(bot: Bot, data: dict):
     if data.get("lottery_message_id") and data.get("chat_id"):
@@ -626,7 +653,6 @@ async def update_lottery_message(bot: Bot, data: dict):
         except Exception as e:
             print(f"Message update error: {e}")
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -634,28 +660,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text  = update.message.text.strip()
     user_id   = update.effective_user.id
     user_name = update.effective_user.first_name or "ተጠቃሚ"
-    chat_type = update.effective_chat.type  # "private" or "group"/"supergroup"
+    chat_type = update.effective_chat.type
 
     # ==================== ADMIN PRIVATE → GEMINI FULL CHAT ====================
     if user_id == ADMIN_TELEGRAM_ID and chat_type == "private":
         data = load_data()
-        print(f"🔐 Admin private: '{raw_text}'")
-
-        # ታሪክ አስቀምጥ
+        print(f"🔐 Admin: '{raw_text}'")
         save_admin_chat_message("user", raw_text)
 
-        # Gemini ጥራ
         response = admin_gemini_chat(raw_text, data)
         if not response:
-            await update.message.reply_text("❌ Gemini አልተናገረም። ቆይተህ ሞክር።")
+            await update.message.reply_text("❌ Gemini አልተናገረም። Quota ሊሆን ይችላል።")
             return
 
-        # SAVE_RULE / DELETE_RULES process
         clean_reply, new_rules, delete_all = process_admin_gemini_response(response)
 
         if delete_all:
             delete_all_admin_rules()
-
         for rule in new_rules:
             save_admin_rule(rule)
 
@@ -664,22 +685,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if delete_all:
             clean_reply += "\n🗑️ ሁሉም ህጎች ተሰርዘዋል።"
 
-        # Gemini reply ታሪክ አስቀምጥ
         save_admin_chat_message("assistant", clean_reply)
-
         await update.message.reply_text(clean_reply)
         return
 
-    # ==================== GROUP → NORMAL BOT MODE ====================
-    data       = load_data()
-    full_state = build_full_state_for_ai(data)
+    # ==================== GROUP → GEMINI BOT MODE ====================
+    data = load_data()
     print(f"📩 {user_name} ({user_id}): '{raw_text}'")
 
-    action_data = ai_brain(raw_text, user_id, user_name, full_state)
+    # User history አስቀምጥ
+    save_user_chat_message(user_id, "user", raw_text)
+
+    action_data = ai_brain(raw_text, user_id, user_name, data)
     print(f"🧠 Action: {action_data}")
 
     if action_data.get("action") == "ask":
-        await update.message.reply_text(action_data.get("reply", "❓"))
+        reply = action_data.get("reply", "❓")
+        save_user_chat_message(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
         return
 
     result = execute_action(action_data, user_id, data)
@@ -691,8 +714,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if filled == 20:
             await update.message.reply_text("🎉 ሁሉም slots ተሞልቷል! ዕጣ ቅርብ ነው! 🎰")
 
+    save_user_chat_message(user_id, "assistant", result["reply"])
     await update.message.reply_text(result["reply"])
-
 
 # ==================== KEEP ALIVE ====================
 
@@ -712,7 +735,7 @@ def run_server():
 
 def main():
     if not GEMINI_KEYS:
-        print("❌ ምንም Gemini API key አልተገኘም!")
+        print("❌ ምንም Gemini key አልተገኘም!")
         return
 
     init_db()
@@ -747,8 +770,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    print(f"✅ {len(GEMINI_KEYS)} Gemini API keys loaded")
-    print("✅ Bot እየሰራ ነው... (Neon DB + Gemini Full Context)")
+    print(f"✅ {len(GEMINI_KEYS)} Gemini keys loaded")
+    print("✅ Bot እየሰራ ነው...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
